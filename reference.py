@@ -2,15 +2,14 @@
 Clean PyTorch reference implementation of telescoping (multiresolution)
 attention: the algorithm to be implemented in CuTeDSL.
 
-Extracted verbatim from test/test_tiled.py (the frozen semantic / kernel-shape
-reference). This module contains ONLY the implementation; every historical
-oracle (scan plan, dense flattened-mask reference, loop POCs) stays in the
-test files. Behavioral contracts are enforced by:
+This module contains ONLY the implementation; every historical oracle (scan
+plan, dense flattened-mask reference, loop POCs, analytic range oracles)
+lives in the test files. Behavioral contracts are enforced by:
 
-    test/test_reference.py          this module == test_tiled.py, bitwise
-    test/test_tiled.py              forward equivalence chain, (out, lse)
-    test/test_backward.py           end-to-end gradient oracle
-    test/test_explicit_backward.py  Phase-2 backward at the packed boundary
+    test/test_forward.py    forward equivalence chain, (out, lse) contract
+    test/test_backward.py   end-to-end gradient oracle, Phase-2 backward at
+                            the packed boundary, and their composition
+    test/test_range.py      range_spec properties
 
 Pipeline
 --------

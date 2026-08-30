@@ -1,6 +1,6 @@
 """
 Exhaustive verification of telescope_cache/range_spec.py against the analytic
-range oracles in test_tiled.py, at small N.
+range oracles in test_forward.py, at small N.
 
 Properties checked per configuration and level (all half-open):
 
@@ -17,7 +17,7 @@ Properties checked per configuration and level (all half-open):
                contains every Q_l(k) (required); exactness measured
     domain     out-of-domain inputs raise ValueError; empty windows -> (0,0)
 
-Run:  python test_range_spec.py            (pure Python + torch for the block oracle)
+Run:  python test_range.py            (pure Python + torch for the block oracle)
 """
 
 import os
@@ -39,7 +39,7 @@ from telescope_cache.range_spec import (  # noqa: E402
     packed_bounds,
     range_bounds,
 )
-from test_tiled import (  # noqa: E402
+from test_forward import (  # noqa: E402  (range oracles)
     dyadic_ranges_for_query,
     dyadic_ranges_for_query_block,
     validate_dyadic_fmap,

@@ -2,20 +2,27 @@ import argparse
 import math
 import os
 import sys
-from typing import Dict, List, NamedTuple, Tuple
+from typing import Dict, List
 
 import torch
 
-# The tiled POC consumes the pure-integer range specification. Make
-# `telescope_cache` importable (namespace package, as in test_vs_train.py).
+# Make `telescope_cache` importable (namespace package).
 _HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.abspath(os.path.join(_HERE, "..", "..")))
 
+# The implementation under test lives in telescope_cache/reference.py. This
+# file holds ONLY the historical oracles it is checked against and the
+# six-configuration forward harness.
 from telescope_cache.range_spec import (  # noqa: E402
     RangeSpec,
-    bwd_bounds,
-    fwd_bounds,
     range_bounds,
+)
+from telescope_cache.reference import (  # noqa: E402
+    PackedKV,  # noqa: F401  (re-exported for test_backward.py)
+    build_dyadic_summaries,
+    compute_summary_weights,
+    multilevel_attention_forward,
+    pack_levels,
 )
 
 
@@ -108,46 +115,6 @@ def get_structured_plan(
 
 
 # ============================================================
-# Shared leaf-weight computation: identical semantics to the
-# original q-k score used to weight the hierarchy.
-# ============================================================
-
-def compute_summary_weights(
-    q: torch.Tensor,
-    k: torch.Tensor,
-) -> torch.Tensor:
-    """
-    Parameters
-    ----------
-    q: [B, N, Hq, Dk]
-    k: [B, N, Hkv, Dk]
-
-    Returns
-    -------
-    w: [B, N, Hkv, 1]
-
-    For each KV head, groups its associated query heads and computes
-
-        w = logsumexp_h(q_h^T k / sqrt(Dk)).
-    """
-    B, N, Hq, Dk = q.shape
-    _, Nk, Hkv, Dkk = k.shape
-
-    assert N == Nk
-    assert Dk == Dkk
-    assert Hq % Hkv == 0
-
-    expansion = Hq // Hkv
-    q_grouped = q.reshape(B, N, Hkv, expansion, Dk)
-
-    scores = (
-        q_grouped * k.unsqueeze(3)
-    ).sum(dim=-1) / math.sqrt(Dk)  # [B, N, Hkv, expansion]
-
-    return torch.logsumexp(scores, dim=3, keepdim=True)
-
-
-# ============================================================
 # Reference Phase 1: original plan-based recursive scan, but
 # kept level-major instead of flattening the hierarchy.
 # ============================================================
@@ -223,176 +190,6 @@ def build_plan_based_summaries(
         )
 
     return k_levels, v_levels, w_levels, valid_levels
-
-
-# ============================================================
-# New Phase 1: canonical dyadic hierarchy.
-# ============================================================
-
-def build_dyadic_summaries(
-    q: torch.Tensor,
-    k: torch.Tensor,
-    v: torch.Tensor,
-    num_summary_levels: int,
-    detach_weights: bool = False,
-):
-    """
-    Build a canonical dyadic K/V summary tree directly.
-
-    detach_weights: gradient-only switch (see build_plan_based_summaries).
-
-    Canonical level numbering:
-        L0: raw tokens, span 1
-        L1: 2-token summaries
-        L2: 4-token summaries
-        L3: 8-token summaries
-        ...
-
-    No merge_plan, dummy nodes, index_select, or flattened cache is needed.
-
-    For odd level lengths, only complete adjacent pairs are merged. This is
-    exactly the set of complete aligned dyadic intervals available at the
-    next level.
-    """
-    w = compute_summary_weights(q, k)
-    if detach_weights:
-        w = w.detach()
-
-    k_levels = [k]
-    v_levels = [v]
-    w_levels = [w]
-
-    for _level in range(1, num_summary_levels + 1):
-        k_prev = k_levels[-1]
-        v_prev = v_levels[-1]
-        w_prev = w_levels[-1]
-
-        usable = (k_prev.shape[1] // 2) * 2
-
-        if usable == 0:
-            B, _, Hkv, Dk = k_prev.shape
-            Dv = v_prev.shape[-1]
-            k_levels.append(k_prev.new_empty(B, 0, Hkv, Dk))
-            v_levels.append(v_prev.new_empty(B, 0, Hkv, Dv))
-            w_levels.append(w_prev.new_empty(B, 0, Hkv, 1))
-            continue
-
-        # [B, N_parent, 2, Hkv, D]
-        k_children = torch.stack(
-            [k_prev[:, 0:usable:2], k_prev[:, 1:usable:2]],
-            dim=2,
-        )
-        v_children = torch.stack(
-            [v_prev[:, 0:usable:2], v_prev[:, 1:usable:2]],
-            dim=2,
-        )
-        w_children = torch.stack(
-            [w_prev[:, 0:usable:2], w_prev[:, 1:usable:2]],
-            dim=2,
-        )
-
-        alpha = torch.softmax(w_children, dim=2)
-
-        k_parent = (k_children * alpha).sum(dim=2)
-        v_parent = (v_children * alpha).sum(dim=2)
-        w_parent = torch.logsumexp(w_children, dim=2)
-
-        k_levels.append(k_parent)
-        v_levels.append(v_parent)
-        w_levels.append(w_parent)
-
-    return k_levels, v_levels, w_levels
-
-
-# ============================================================
-# Packed level-major K/V representation.
-#
-#     [ L0 | L1 | ... | LL ]     level_offsets[l] = sum_{j<l} N_j
-#
-# Level-local range [start, end) from range_spec addresses physical entries
-# offset[level] + [start, end). POC physical layout is BSHD, [B, sumN, H, D]
-# (kernel layout undecided; [B, H, sumN, D] gives contiguous per-head
-# streams). torch.cat keeps the autograd graph intact, which the upcoming
-# backward oracle relies on; the Phase-1 kernel should instead allocate the
-# packed buffer once and write each level into its interval. w_levels are
-# deliberately not packed: Phase-2 attention needs only K and V.
-# ============================================================
-
-class PackedKV(NamedTuple):
-    k: torch.Tensor                 # [B, sumN, Hkv, Dk]
-    v: torch.Tensor                 # [B, sumN, Hkv, Dv]
-    level_offsets: Tuple[int, ...]  # len num_levels + 1, derived from tensors
-
-
-def pack_levels(
-    k_levels: List[torch.Tensor],
-    v_levels: List[torch.Tensor],
-) -> PackedKV:
-    if len(k_levels) != len(v_levels) or not k_levels:
-        raise ValueError("k_levels and v_levels must be nonempty, same length")
-    B, _, Hkv, Dk = k_levels[0].shape
-    Dv = v_levels[0].shape[-1]
-    device = k_levels[0].device
-    k_dtype, v_dtype = k_levels[0].dtype, v_levels[0].dtype
-
-    # Offsets come from the actual tensors, never from RangeSpec, so that the
-    # test's comparison against spec.level_offsets() is a real check.
-    offsets = [0]
-    for level, (k_l, v_l) in enumerate(zip(k_levels, v_levels)):
-        if k_l.shape[1] != v_l.shape[1]:
-            raise ValueError(
-                f"level {level}: K length {k_l.shape[1]} != V length "
-                f"{v_l.shape[1]}"
-            )
-        if k_l.shape[0] != B or v_l.shape[0] != B:
-            raise ValueError(f"level {level}: batch mismatch")
-        if k_l.shape[2] != Hkv or v_l.shape[2] != Hkv:
-            raise ValueError(f"level {level}: Hkv mismatch")
-        if k_l.shape[-1] != Dk or v_l.shape[-1] != Dv:
-            raise ValueError(f"level {level}: head-dim mismatch")
-        if k_l.device != device or v_l.device != device:
-            raise ValueError(f"level {level}: device mismatch")
-        if k_l.dtype != k_dtype or v_l.dtype != v_dtype:
-            raise ValueError(f"level {level}: dtype mismatch")
-        offsets.append(offsets[-1] + k_l.shape[1])
-
-    return PackedKV(
-        k=torch.cat(k_levels, dim=1),
-        v=torch.cat(v_levels, dim=1),
-        level_offsets=tuple(offsets),
-    )
-
-
-def _packed_slice(
-    packed: PackedKV, level: int, k_start: int, k_end: int
-) -> Tuple[int, int]:
-    """
-    The boundary k_local (range spec) -> k_physical (packed storage):
-    level-local [k_start, k_end) -> physical [p_start, p_end). Shared by the
-    forward reads (_kv_tile) and the backward writes so the boundary checks
-    live in one place.
-    """
-    lo = packed.level_offsets[level]
-    hi = packed.level_offsets[level + 1]
-    level_len = hi - lo
-    # Local bounds: catches a packed index passed where a local one belongs.
-    assert 0 <= k_start <= k_end <= level_len, (level, k_start, k_end, level_len)
-    p_start, p_end = lo + k_start, lo + k_end
-    # Physical bounds: a tile never crosses into the next level.
-    assert lo <= p_start <= p_end <= hi, (level, p_start, p_end, lo, hi)
-    return p_start, p_end
-
-
-def _kv_tile(
-    packed: PackedKV, b: int, hkv: int, level: int, k_start: int, k_end: int
-):
-    """
-    Read one level-local KV tile from the packed buffers. The only place the
-    forward POC slices the packed buffer; switching physical layout changes
-    this function (and pack_levels / the pack oracle / the backward writes).
-    """
-    p_start, p_end = _packed_slice(packed, level, k_start, k_end)
-    return packed.k[b, p_start:p_end, hkv], packed.v[b, p_start:p_end, hkv]
 
 
 # ============================================================
@@ -1051,8 +848,8 @@ def multilevel_attention_ranges_online_poc(
 
 
 # ============================================================
-# Phase 2, version E: query-block / KV-tile FlashAttention POC.
-# This is the last Python bridge before a custom GPU kernel.
+# Vectorized range oracle for one query block (the kernel-shaped
+# forward itself is reference.multilevel_attention_forward).
 # ============================================================
 
 def dyadic_ranges_for_query_block(
@@ -1156,517 +953,6 @@ def dyadic_ranges_for_query_block(
     )
 
     return starts, ends
-
-
-def multilevel_attention_tiled_poc(
-    q: torch.Tensor,
-    packed: PackedKV,
-    fmap: Dict[int, int],
-    cache_size: int,
-    block_m: int = 16,
-    block_n: int = 32,
-    softcap: float = 20.0,
-):
-    """
-    FlashAttention-shaped PyTorch POC for multiresolution attention over the
-    packed level-major K/V buffers (see pack_levels).
-
-    The computational organization is intentionally close to the eventual
-    custom kernel:
-
-      for batch
-        for KV head                     # exploit GQA sharing
-          for BLOCK_M query positions
-            keep Q and online-softmax state live
-            for hierarchy level
-              find union KV interval for the Q block   (level-local)
-              for BLOCK_N contiguous KV tile in that interval
-                load K/V once from offset[level] + tile
-                QK matmul
-                mask each query to its own [start,end) range
-                online-softmax update
-
-    Important properties
-    --------------------
-    * No old scan plan.
-    * No flattened *selection* cache; K/V live in one level-major buffer.
-    * No N x cache_len Boolean mask.
-    * KV accesses within each level are contiguous in the packed index.
-    * All GQA query heads belonging to one KV head reuse the same K/V tile.
-    * One global (m, ell, acc) state is maintained across every level/tile.
-
-    This implementation still uses Python loops and PyTorch operations for
-    correctness. It is not meant to benchmark performance.
-
-    Forward contract
-    ----------------
-        out, lse = multilevel_attention_tiled_poc(...)
-
-        out: [B, N, Hq, Dv], dtype = V.dtype
-        lse: [B, N, Hq],     dtype = torch.float32, finite everywhere.
-             Natural-log log-sum-exp of the final attention scores S over
-             exactly the multiresolution KV set A(q) of each query, where
-
-                 S[q,k] = c * tanh( (q.k / sqrt(Dk)) / c )   if softcap=c
-                        = q.k / sqrt(Dk)                     if softcap=None
-
-                 LSE[b,q,h] = log sum_{k in A(q)} exp( S[q,k] ).
-
-    Natural log is the API; a kernel that uses exp2 internally must convert.
-    This is the Phase-2 *attention* LSE and is unrelated to the Phase-1
-    summary weight w = logsumexp_h(q_h.k / sqrt(Dk)) from
-    compute_summary_weights(). It is exactly the state the backward needs to
-    recompute P = exp(S - LSE) without storing P.
-    """
-    B, N, Hq, Dk = q.shape
-    Hkv = packed.k.shape[2]
-    Dv = packed.v.shape[-1]
-
-    if Hq % Hkv != 0:
-        raise ValueError(
-            f"Hq={Hq} must be divisible by Hkv={Hkv}."
-        )
-
-    expansion = Hq // Hkv
-
-    # All range arithmetic comes from the pure-integer spec (range_spec.py),
-    # in level-local coordinates:
-    #   fwd_bounds   -> the KV tile range a query block streams per level
-    #   range_bounds -> each row's own [k_lo, k_hi)
-    #   elem_mask    -> realized vectorized below as (k >= k_lo) & (k < k_hi)
-    # Storage addressing (offset[level] + local) happens only in _kv_tile.
-    spec = RangeSpec.from_fmap(fmap, cache_size, N)
-
-    # The packed buffer's geometry (derived from the tensors) must match the
-    # geometry the schedule predicts.
-    if tuple(packed.level_offsets) != spec.level_offsets():
-        raise ValueError(
-            f"packed level_offsets {tuple(packed.level_offsets)} != "
-            f"spec {spec.level_offsets()}"
-        )
-
-    out = torch.empty(
-        B, N, Hq, Dv, device=q.device, dtype=packed.v.dtype
-    )
-    # NaN-initialized so the test's isfinite() check doubles as an
-    # "every row was written" check (POC only; a kernel need not do this).
-    attn_lse = torch.full(
-        (B, N, Hq), float("nan"), device=q.device, dtype=torch.float32
-    )
-    scale = 1.0 / math.sqrt(Dk)
-
-    # POC loops over batch explicitly. A GPU kernel would normally make batch
-    # part of the program/grid index.
-    for b in range(B):
-        # One logical program family per KV head. All associated query heads
-        # share the K/V tiles loaded for this KV head.
-        for hkv in range(Hkv):
-            hq_start = hkv * expansion
-            hq_end = (hkv + 1) * expansion
-            hq_slice = slice(hq_start, hq_end)
-
-            for q_start in range(0, N, block_m):
-                q_end = min(q_start + block_m, N)
-                M = q_end - q_start
-
-                # [M, E, Dk], where E=GQA expansion.
-                # The custom kernel would keep this Q tile in registers/shared
-                # memory while streaming all hierarchy levels.
-                Q = q[b, q_start:q_end, hq_slice]
-
-                # FlashAttention online-softmax state for every
-                # (query position, query head) row in this program.
-                m = torch.full(
-                    (M, expansion),
-                    -float("inf"),
-                    device=q.device,
-                    dtype=torch.float32,
-                )
-                ell = torch.zeros(
-                    M, expansion, device=q.device, dtype=torch.float32
-                )
-                acc = torch.zeros(
-                    M, expansion, Dv,
-                    device=q.device,
-                    dtype=torch.float32,
-                )
-
-                # Stream hierarchy levels. This loop mirrors the logical
-                # kernel spec:
-                #
-                #   for level:
-                #     [tile_k_lo, tile_k_hi) = fwd_bounds(q_start, q_end, level)
-                #     per-row [row_k_lo, row_k_hi) = range_bounds(q, level)
-                #     for KV tile in [tile_k_lo, tile_k_hi):        (level-local)
-                #       K, V = packed[offset[level] + tile]        (storage)
-                #       valid = physical_bounds AND k >= row_k_lo AND k < row_k_hi
-                #
-                # Only the semantics are frozen: a real kernel computes the
-                # hull in O(1) from the first/last nonempty rows (monotone
-                # bounds, see range_spec) rather than scanning BLOCK_M rows,
-                # and derives row bounds in registers rather than from lists.
-                # Physical bounds are implicit here (slices never exceed the
-                # level length); a real kernel must predicate padded lanes of
-                # a BLOCK_N tile before applying this semantic mask.
-                for level in range(spec.num_levels):
-                    # Hull of all rows' ranges: the tile range to stream,
-                    # exactly as SWA kernels load tiles intersecting a query
-                    # block's band and mask per element.
-                    tile_k_lo, tile_k_hi = fwd_bounds(
-                        spec, q_start, q_end, level
-                    )
-                    if tile_k_lo == tile_k_hi:
-                        continue
-
-                    rows = [
-                        range_bounds(spec, qi, level)
-                        for qi in range(q_start, q_end)
-                    ]
-                    level_start = torch.tensor(
-                        [lo for lo, _ in rows],
-                        device=q.device, dtype=torch.long,
-                    )
-                    level_end = torch.tensor(
-                        [hi for _, hi in rows],
-                        device=q.device, dtype=torch.long,
-                    )
-
-                    # Stream contiguous KV tiles from this hierarchy level.
-                    for k_start in range(
-                        tile_k_lo, tile_k_hi, block_n
-                    ):
-                        k_end = min(k_start + block_n, tile_k_hi)
-
-                        # Contiguous reads (in packed index) from the
-                        # level-major K/V buffers at offset[level] + tile,
-                        # shared across BLOCK_M queries and all E GQA heads.
-                        K, V = _kv_tile(
-                            packed, b, hkv, level, k_start, k_end
-                        )  # [Ktile, Dk], [Ktile, Dv]
-
-                        # Tensor-Core-shaped operation conceptually:
-                        #   [M*E, Dk] @ [Dk, Ktile]
-                        scores = torch.einsum(
-                            "med,kd->mek", Q, K
-                        ) * scale
-
-                        if softcap is not None:
-                            scores = softcap * torch.tanh(
-                                scores / softcap
-                            )
-
-                        kv_indices = torch.arange(
-                            k_start,
-                            k_end,
-                            device=q.device,
-                            dtype=torch.long,
-                        )
-
-                        # Per-query range mask INSIDE the tile: the vectorized
-                        # realization of range_spec.elem_mask. This is only
-                        # [M, Ktile], never [N, cache_len]. Query heads sharing
-                        # one query position use the same mask.
-                        valid = (
-                            (kv_indices[None, :] >= level_start[:, None])
-                            & (kv_indices[None, :] < level_end[:, None])
-                        )  # [M, Ktile]
-
-                        scores = scores.masked_fill(
-                            ~valid[:, None, :], -float("inf")
-                        )
-
-                        # --------------------------------------------------
-                        # FlashAttention online-softmax update.
-                        # --------------------------------------------------
-                        active = valid.any(dim=1)[:, None].expand(
-                            -1, expansion
-                        )
-                        block_max = scores.float().max(dim=-1).values
-                        m_candidate = torch.maximum(m, block_max)
-                        m_new = torch.where(active, m_candidate, m)
-
-                        # For an active row whose previous m=-inf, this is
-                        # exp(-inf - finite)=0, which is exactly what we want.
-                        # Inactive rows use scale exp(0)=1 and leave state
-                        # unchanged. The where() sits INSIDE exp() on purpose:
-                        # inactive rows have m = m_new = -inf, and exp() must
-                        # never consume (-inf) - (-inf) = nan, because exp's
-                        # autograd backward (grad * exp(x)) would turn the
-                        # zero gradient of the unselected branch into 0 * nan
-                        # and poison dq/dk/dv. Forward values are identical.
-                        old_scale = torch.exp(
-                            torch.where(
-                                active,
-                                m - m_new,
-                                torch.zeros_like(m),
-                            )
-                        )
-
-                        # Avoid -inf - -inf for masked/inactive positions.
-                        shifted = torch.where(
-                            valid[:, None, :],
-                            scores.float() - m_new[:, :, None],
-                            torch.full_like(
-                                scores.float(), -float("inf")
-                            ),
-                        )
-                        p = torch.exp(shifted)
-
-                        ell = ell * old_scale + p.sum(dim=-1)
-                        acc = (
-                            acc * old_scale[:, :, None]
-                            + torch.einsum(
-                                "mek,kd->med", p, V.float()
-                            )
-                        )
-                        m = m_new
-
-                if (ell == 0).any():
-                    raise RuntimeError(
-                        f"Found query rows with no attended KV entries in "
-                        f"block [{q_start},{q_end})."
-                    )
-
-                out[b, q_start:q_end, hq_slice] = (
-                    acc / ell[:, :, None]
-                ).to(out.dtype)
-                # Online-softmax state -> per-row LSE (natural log, FP32).
-                attn_lse[b, q_start:q_end, hq_slice] = m + torch.log(ell)
-
-    return out, attn_lse
-
-
-# ============================================================
-# Explicit FlashAttention-style Phase-2 backward POC over the packed
-# K/V buffers. Two passes, no atomics, no materialized P:
-#
-#   Pass A (Q-owned dQ):    Q-block --fwd_bounds--> K-tiles
-#   Pass B (KV-owned dK/dV): K-tile --bwd_bounds--> Q-tiles
-#
-# Per Q x K tile (all FP32):
-#   X  = Q K^T * scale                     scale = 1/sqrt(Dk)
-#   S  = c*tanh(X/c)  (softcap=c) | X      softcap_grad = 1 - tanh(X/c)^2 | 1
-#   P  = exp(S - LSE_q) on valid (q,k), else 0     <- SAVED forward lse
-#   Delta_q = sum_d dO_qd O_qd                     <- computed once
-#   dV += P^T dO      dP = dO V^T      dS = P * (dP - Delta)
-#   dX  = dS * softcap_grad
-#   dQ += scale * dX K                 dK += scale * dX^T Q
-#
-# The hulls from fwd_bounds / bwd_bounds (and BLOCK_M alignment of the
-# latter) are conservative; the tile-local element mask is exact, so
-# invalid entries have P = dS = dX = 0 and over-enumeration changes only
-# work, never semantics. `lse` must be the forward's saved value (this is
-# where the Step-2 (out, lse) contract is consumed); it is never recomputed.
-# ============================================================
-
-def _tile_grads(
-    Q, K, V, dO, lse_t, delta_t, valid, scale, softcap, *, need_dq, need_dkv
-):
-    """
-    Shared per-tile backward math for both passes.
-
-    Q [M,E,Dk]  K [Kt,Dk]  V [Kt,Dv]  dO [M,E,Dv]  lse_t/delta_t [M,E]
-    valid [M,Kt] (tile-local elem_mask, vectorized)
-    Returns (dQ [M,E,Dk] | None, dK [Kt,Dk] | None, dV [Kt,Dv] | None), FP32.
-    """
-    Qf, Kf, Vf, dOf = Q.float(), K.float(), V.float(), dO.float()
-
-    x = torch.einsum("med,kd->mek", Qf, Kf) * scale
-    if softcap is not None:
-        t = torch.tanh(x / softcap)
-        s = softcap * t
-        softcap_grad = 1.0 - t * t
-    else:
-        s = x
-        softcap_grad = None
-
-    valid3 = valid[:, None, :]
-    zeros = torch.zeros_like(s)
-    # P reconstructed from the SAVED forward LSE. The where() sits before
-    # exp() so exp never sees an invalid score (which is unconstrained by
-    # the row's LSE and could overflow to a useless inf temporary):
-    #   P = exp(S - LSE_q) on valid (q,k), else exp(-inf) = 0.
-    shifted = torch.where(
-        valid3, s - lse_t[:, :, None], torch.full_like(s, -float("inf"))
-    )
-    p = torch.exp(shifted)
-
-    dP = torch.einsum("med,kd->mek", dOf, Vf)
-    dS = p * (dP - delta_t[:, :, None])
-    dX = dS * softcap_grad if softcap_grad is not None else dS
-    dX = torch.where(valid3, dX, zeros)  # already 0 via p; keep explicit
-
-    dQ = scale * torch.einsum("mek,kd->med", dX, Kf) if need_dq else None
-    dK = scale * torch.einsum("mek,med->kd", dX, Qf) if need_dkv else None
-    dV = torch.einsum("mek,med->kd", p, dOf) if need_dkv else None
-    return dQ, dK, dV
-
-
-@torch.no_grad()
-def multilevel_attention_backward_poc(
-    q: torch.Tensor,
-    packed: PackedKV,
-    out: torch.Tensor,
-    lse: torch.Tensor,
-    dout: torch.Tensor,
-    fmap: Dict[int, int],
-    cache_size: int,
-    block_m: int = 16,
-    block_n: int = 32,
-    softcap: float = 20.0,
-):
-    """
-    Explicit Phase-2 backward at the packed boundary (see block comment).
-
-    Contracts
-    ---------
-        q        [B, N, Hq, Dk]      out   [B, N, Hq, Dv]
-        packed.k [B, sumN, Hkv, Dk]  lse   [B, N, Hq] float32 (saved forward)
-        packed.v [B, sumN, Hkv, Dv]  dout  [B, N, Hq, Dv]
-
-        dq        [B, N, Hq, Dk]     (q.dtype)
-        dk_packed [B, sumN, Hkv, Dk] (packed.k.dtype)
-        dv_packed [B, sumN, Hkv, Dv] (packed.v.dtype)
-        stats     diagnostic dict (never asserted on)
-
-    Non-differentiable by construction (@torch.no_grad): it reads graph-
-    attached packed.k/v VALUES without building a higher-order graph, so a
-    caller may still use the returned dk/dv_packed as VJP seeds into the
-    Phase-1 graph that produced packed.k/v.
-    """
-    B, N, Hq, Dk = q.shape
-    Hkv = packed.k.shape[2]
-    Dv = packed.v.shape[-1]
-    if Hq % Hkv != 0:
-        raise ValueError(f"Hq={Hq} must be divisible by Hkv={Hkv}.")
-    E = Hq // Hkv
-    if tuple(out.shape) != (B, N, Hq, Dv):
-        raise ValueError(f"out shape {tuple(out.shape)} != {(B, N, Hq, Dv)}")
-    if tuple(dout.shape) != (B, N, Hq, Dv):
-        raise ValueError(f"dout shape {tuple(dout.shape)} != {(B, N, Hq, Dv)}")
-    if tuple(lse.shape) != (B, N, Hq) or lse.dtype != torch.float32:
-        raise ValueError("lse must be float32 [B, N, Hq]")
-
-    spec = RangeSpec.from_fmap(fmap, cache_size, N)
-    if tuple(packed.level_offsets) != spec.level_offsets():
-        raise ValueError("packed level_offsets do not match the schedule")
-
-    scale = 1.0 / math.sqrt(Dk)
-    device = q.device
-
-    # Delta_q = sum_d dO_qd O_qd = sum_k P_qk dP_qk: no pre-pass over KV.
-    delta = (dout.float() * out.float()).sum(dim=-1)  # [B, N, Hq]
-
-    dq_acc = torch.zeros(B, N, Hq, Dk, device=device, dtype=torch.float32)
-    dk_acc = torch.zeros_like(packed.k, dtype=torch.float32)
-    dv_acc = torch.zeros_like(packed.v, dtype=torch.float32)
-
-    stats = {
-        "kv_tiles": 0,
-        "q_tiles_enumerated": 0,
-        "all_false_qk_tiles": 0,
-        "empty_bwd_hulls": 0,
-        "softcap_used": softcap is not None,
-    }
-
-    def row_bounds(q0, q1, level):
-        rows = [range_bounds(spec, qi, level) for qi in range(q0, q1)]
-        lo = torch.tensor([r[0] for r in rows], device=device, dtype=torch.long)
-        hi = torch.tensor([r[1] for r in rows], device=device, dtype=torch.long)
-        return lo, hi
-
-    # ------------------------------------------------------------------
-    # Pass A: Q-owned dQ, same traversal as the forward.
-    # ------------------------------------------------------------------
-    for b in range(B):
-        for hkv in range(Hkv):
-            hq_slice = slice(hkv * E, (hkv + 1) * E)
-            for q_start in range(0, N, block_m):
-                q_end = min(q_start + block_m, N)
-                M = q_end - q_start
-                Q = q[b, q_start:q_end, hq_slice]
-                dO = dout[b, q_start:q_end, hq_slice]
-                lse_t = lse[b, q_start:q_end, hq_slice]
-                delta_t = delta[b, q_start:q_end, hq_slice]
-                dQ_tile = torch.zeros(M, E, Dk, device=device, dtype=torch.float32)
-
-                for level in range(spec.num_levels):
-                    tile_k_lo, tile_k_hi = fwd_bounds(spec, q_start, q_end, level)
-                    if tile_k_lo == tile_k_hi:
-                        continue
-                    row_lo, row_hi = row_bounds(q_start, q_end, level)
-                    for k_start in range(tile_k_lo, tile_k_hi, block_n):
-                        k_end = min(k_start + block_n, tile_k_hi)
-                        K, V = _kv_tile(packed, b, hkv, level, k_start, k_end)
-                        kv_idx = torch.arange(k_start, k_end, device=device)
-                        valid = (kv_idx[None, :] >= row_lo[:, None]) & (
-                            kv_idx[None, :] < row_hi[:, None]
-                        )
-                        dQ_t, _, _ = _tile_grads(
-                            Q, K, V, dO, lse_t, delta_t, valid, scale, softcap,
-                            need_dq=True, need_dkv=False,
-                        )
-                        dQ_tile += dQ_t
-
-                dq_acc[b, q_start:q_end, hq_slice] = dQ_tile
-
-    # ------------------------------------------------------------------
-    # Pass B: KV-owned dK/dV, K-tile -> candidate Q-tiles via bwd_bounds.
-    # ------------------------------------------------------------------
-    for b in range(B):
-        for hkv in range(Hkv):
-            hq_slice = slice(hkv * E, (hkv + 1) * E)
-            for level in range(spec.num_levels):
-                level_len = spec.level_len(level)
-                for k_start in range(0, level_len, block_n):
-                    k_end = min(k_start + block_n, level_len)
-                    stats["kv_tiles"] += 1
-
-                    # Level-local coordinates only; hull may be conservative.
-                    q_lo, q_hi = bwd_bounds(spec, k_start, k_end, level)
-                    if q_lo == q_hi:
-                        stats["empty_bwd_hulls"] += 1
-                        continue
-
-                    K, V = _kv_tile(packed, b, hkv, level, k_start, k_end)
-                    kv_idx = torch.arange(k_start, k_end, device=device)
-                    Kt = k_end - k_start
-                    dK_tile = torch.zeros(Kt, Dk, device=device, dtype=torch.float32)
-                    dV_tile = torch.zeros(Kt, Dv, device=device, dtype=torch.float32)
-
-                    # Aligned BLOCK_M Q tiles intersecting the hull.
-                    for q0 in range((q_lo // block_m) * block_m, q_hi, block_m):
-                        q1 = min(q0 + block_m, N)
-                        stats["q_tiles_enumerated"] += 1
-                        row_lo, row_hi = row_bounds(q0, q1, level)
-                        valid = (kv_idx[None, :] >= row_lo[:, None]) & (
-                            kv_idx[None, :] < row_hi[:, None]
-                        )
-                        if not bool(valid.any().item()):
-                            stats["all_false_qk_tiles"] += 1
-                            continue
-                        Q = q[b, q0:q1, hq_slice]
-                        dO = dout[b, q0:q1, hq_slice]
-                        lse_t = lse[b, q0:q1, hq_slice]
-                        delta_t = delta[b, q0:q1, hq_slice]
-                        _, dK_t, dV_t = _tile_grads(
-                            Q, K, V, dO, lse_t, delta_t, valid, scale, softcap,
-                            need_dq=False, need_dkv=True,
-                        )
-                        dK_tile += dK_t
-                        dV_tile += dV_t
-
-                    # Storage addressing: offset[level] + local, checked once.
-                    p_start, p_end = _packed_slice(packed, level, k_start, k_end)
-                    dk_acc[b, p_start:p_end, hkv] = dK_tile
-                    dv_acc[b, p_start:p_end, hkv] = dV_tile
-
-    return (
-        dq_acc.to(q.dtype),
-        dk_acc.to(packed.k.dtype),
-        dv_acc.to(packed.v.dtype),
-        stats,
-    )
 
 
 # ============================================================
@@ -1785,7 +1071,8 @@ def check_summary_equivalence(
 # Every case runs the full chain
 #
 #     plan POC == dense reference == dyadic POC
-#              == analytic-range POC == online POC == tiled POC (packed K/V)
+#              == analytic-range POC == online POC
+#              == reference.multilevel_attention_forward (packed K/V)
 #
 # plus the analytic-ranges-vs-remapped-plan oracle, the range_spec and
 # packed-geometry oracles, and asserts a set of
@@ -1796,13 +1083,13 @@ def check_summary_equivalence(
 # slow -- particularly on CUDA, because multilevel_attention_plan_poc /
 # _dyadic_poc do ~N*cache_size scalar .item() calls per case (about 164k at
 # N=1024, cache_size=160), and every CUDA .item() is a host-device
-# synchronization. The tiled POC intentionally performs its range arithmetic
+# synchronization. The reference forward intentionally performs its range arithmetic
 # as Python integer calls into range_spec and constructs small metadata
 # tensors per query block and level. Runtime is not representative of the
 # intended kernel. Use filtered cases and/or --device cpu during development;
 # the full suite is a correctness regression test.
 #
-#     python test_tiled.py [--device cpu|cuda] [case ...]
+#     python test_forward.py [--device cpu|cuda] [case ...]
 # ============================================================
 
 RTOL = 1e-5
@@ -1843,8 +1130,8 @@ def check_block_ranges_match_scalar(
     device: torch.device,
 ):
     """
-    The tiled POC is the only consumer of the vectorized range computation.
-    Check it row-by-row against the scalar version for every query.
+    Check the vectorized range oracle row-by-row against the scalar
+    version for every query.
     Returns (starts, ends) as [N, num_levels] long tensors.
     """
     activation_times = validate_dyadic_fmap(fmap)
@@ -2067,9 +1354,9 @@ def run_case(
     oracles.append("ranges-plan ✓")
     oracles.append("block-scalar ✓")  # check_block_ranges_match_scalar above
 
-    # The pure-integer spec the tiled POC consumes must agree with the
-    # block oracle for every query and level (ties range_spec.py to this
-    # suite; test_range_spec.py holds the exhaustive property tests).
+    # The pure-integer spec the reference forward consumes must agree with
+    # the block oracle for every query and level (ties range_spec.py to this
+    # suite; test_range.py holds the exhaustive property tests).
     spec = RangeSpec.from_fmap(fmap, cache_size, N)
     starts_l, ends_l = starts.tolist(), ends.tolist()
     for qi in range(N):
@@ -2156,7 +1443,7 @@ def run_case(
     report("out: online vs ranges", out_online, out_ranges)
     report("out: online vs dense", out_online, out_dense)
 
-    out_tiled, lse_tiled = multilevel_attention_tiled_poc(
+    out_tiled, lse_tiled = multilevel_attention_forward(
         q, packed, fmap, cache_size,
         block_m=block_m, block_n=block_n,
     )
@@ -2196,7 +1483,7 @@ CASES = [
         ),
     ),
     # Steady-state coarsest-level eviction, partial Q/K tiles, Dv != Dk.
-    # Same config as test_vs_train.py case 2.
+    # Same config that was validated against fms/train.py's flex_attention.
     dict(
         name="eviction",
         B=1, N=1024, Hq=4, Hkv=2, Dk=32, Dv=64,
@@ -2263,7 +1550,7 @@ CASES = [
 
 def main(argv=None):
     parser = argparse.ArgumentParser(
-        description="Telescoping-cache forward POC equivalence suite."
+        description="Telescoping-cache forward equivalence suite (reference.py vs oracles)."
     )
     parser.add_argument(
         "--device", default=None,

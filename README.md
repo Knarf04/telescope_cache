@@ -14,27 +14,20 @@ TODOs:
 | File | Role |
 |---|---|
 | `range_spec.py` | Frozen pure-integer range spec: `range_bounds`, `elem_mask`, `fwd_bounds`, `bwd_bounds`, `node_query_bounds`, packed offsets. Level-local coordinates only. |
-| `reference.py` | **Clean implementation** (extract the kernel from here): summary weights, dyadic builder, `pack_levels`, `multilevel_attention_forward` → `(out, lse)`, explicit two-pass `multilevel_attention_backward`. No oracles. |
-| `test/test_tiled.py` | Frozen semantic / kernel-shape reference plus all historical oracles (scan plan, dense mask, loop POCs) and the six-config forward chain. `reference.py` is extracted verbatim from it. |
-| `test/test_range_spec.py` | Exhaustive property tests of `range_spec` at small N. |
-| `test/test_backward.py` | End-to-end gradient oracle (original chain vs new chain, incl. the `q/k → w →` summary-tree path, `detach_weights`, `dv` invariance). |
-| `test/test_explicit_backward.py` | Phase-2 backward at the packed boundary: explicit backward vs autograd with packed K/V as leaves, saved-LSE reconstruction, softcap derivative, never-visible nodes, explicit Phase 2 + autograd Phase-1 VJP = end-to-end oracle. |
-| `test/test_reference.py` | Proves `reference.py` ≡ `test_tiled.py` (bitwise) and that clean Phase 2 + autograd Phase-1 VJP ≡ the `test_backward.py` oracle. |
-| `test/test_vs_train.py` | Ties `test_tiled.py` to `fms/train.py`'s actual scan + flex_attention (GPU only). |
+| `reference.py` | **The implementation** (extract the kernel from here): summary weights, dyadic builder, `pack_levels`, `multilevel_attention_forward` → `(out, lse)`, explicit two-pass `multilevel_attention_backward`. No oracles. |
+| `test/test_forward.py` | Historical oracles (original scan plan, dense flattened-mask reference, loop POCs, analytic range oracles) and the six-configuration forward chain checking `reference.multilevel_attention_forward` — `out` and `lse` — against all of them, with coverage assertions (warm-up, eviction, odd lengths, partial tiles, `Dv≠Dk`, GQA). Defines `CASES`. |
+| `test/test_backward.py` | Part 1: end-to-end autograd gradient oracle (original chain vs `reference.py`, incl. the `q/k → w →` summary-tree path, `detach_weights`, `dv` invariance). Part 2: `reference.multilevel_attention_backward` vs autograd at the packed boundary (saved-LSE reconstruction, softcap derivative, never-visible nodes, conservative-hull tile). Part 3: explicit Phase 2 + autograd Phase-1 VJP ≡ Part-1 oracle. |
+| `test/test_range.py` | Exhaustive property tests of `range_spec` at small N against the analytic range oracles. |
 
 For kernel work: `reference.py` + `range_spec.py` define **what to implement**;
-the test files define **what must still pass**. Do not consolidate the oracle
-implementations in the test files into the clean module.
+the test files define **what must still pass**. The oracle implementations in
+`test_forward.py` are deliberately *not* part of the clean module.
 
 Run everything (CPU, from `test/`):
 
 ```bash
-python test_range_spec.py && python test_reference.py --device cpu && \
-python test_tiled.py --device cpu && python test_backward.py --device cpu && \
-python test_explicit_backward.py --device cpu
+python test_range.py && python test_forward.py --device cpu && python test_backward.py --device cpu
 ```
-
-`test_vs_train.py` needs a GPU (compiled flex_attention).
 
 ## Flattened cache vs. dyadic tree
 
@@ -43,9 +36,9 @@ process (`get_scan_plan` + `scan`) and hands FlexAttention a dense Boolean
 mask. The tests under `test/` show the same attention can be expressed over a
 **canonical dyadic summary tree** with contiguous per-level storage, which is
 what a custom GPU kernel wants. The two hold identical values; they differ in
-how entries are *addressed*. `test/test_vs_train.py` verifies the equivalence
-against `train.py`'s actual functions; `test/test_tiled.py` carries the chain
-through to a FlashAttention-shaped tiled implementation.
+how entries are *addressed*. `reference.py` is the FlashAttention-shaped
+implementation over the dyadic tree; `test/test_forward.py` carries the
+equivalence chain from the original scan/mask semantics through to it.
 
 ### Worked example
 
@@ -107,7 +100,7 @@ mask:  . . . . . . . 1 1 .  .  .  1  .  1      (Q0 and D zeroed by the validity 
 `create_block_mask` must encode that row for every query: `[8, 15]` here,
 `[N, ~2N]` in general.
 
-#### Dyadic tree (`test_tiled.py`) — 14 entries, three contiguous arrays
+#### Dyadic tree (`reference.py`) — 14 entries, three contiguous arrays
 
 ```
 L0:  idx 0   1   2   3   4   5   6   7
