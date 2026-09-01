@@ -115,15 +115,23 @@ def leaves(q, k, v):
     )
 
 
+def linear_leaves(x, w_proj):
+    return (
+        x.detach().clone().requires_grad_(True),
+        w_proj.detach().clone().requires_grad_(True),
+    )
+
+
 def seeded_randn_like(t, seed):
     g = torch.Generator(device="cpu").manual_seed(seed)
     return torch.randn(t.shape, generator=g, dtype=t.dtype).to(t.device)
 
 
 def reference_path(q, k, v, merge_plan, select_level, select_index,
-                   detach_weights=False):
+                   detach_weights=False, x=None, w_proj=None):
     old_k, old_v, _, old_valid = build_plan_based_summaries(
-        q, k, v, merge_plan, detach_weights=detach_weights
+        q, k, v, merge_plan, detach_weights=detach_weights,
+        x=x, w_proj=w_proj,
     )
     out, _ = dense_reference_attention(
         q, old_k, old_v, old_valid, select_level, select_index
@@ -132,9 +140,10 @@ def reference_path(q, k, v, merge_plan, select_level, select_index,
 
 
 def new_path(q, k, v, num_summary_levels, fmap, cache_size, block_m, block_n,
-             detach_weights=False):
+             detach_weights=False, x=None, w_proj=None):
     dk_levels, dv_levels, _ = build_dyadic_summaries(
-        q, k, v, num_summary_levels, detach_weights=detach_weights
+        q, k, v, num_summary_levels, detach_weights=detach_weights,
+        x=x, w_proj=w_proj,
     )
     packed = pack_levels(dk_levels, dv_levels)
     out, _lse = multilevel_attention_forward(
@@ -165,31 +174,58 @@ def never_visible_mask(spec, device):
 # ----------------------------------------------------------------------------
 
 def part1_end_to_end(q, k, v, merge_plan, sel_level, sel_index, L, fmap,
-                     cache_size, block_m, block_n, dout_seed):
+                     cache_size, block_m, block_n, dout_seed,
+                     weight_mode="qk", x=None, w_proj=None):
+    linear = weight_mode == "linear"
     q_ref, k_ref, v_ref = leaves(q, k, v)
     q_new, k_new, v_new = leaves(q, k, v)
-    out_ref = reference_path(q_ref, k_ref, v_ref, merge_plan, sel_level, sel_index)
-    out_new = new_path(q_new, k_new, v_new, L, fmap, cache_size, block_m, block_n)
+    if linear:
+        x_ref, wp_ref = linear_leaves(x, w_proj)
+        x_new, wp_new = linear_leaves(x, w_proj)
+    else:
+        x_ref = wp_ref = x_new = wp_new = None
+    out_ref = reference_path(q_ref, k_ref, v_ref, merge_plan, sel_level,
+                             sel_index, x=x_ref, w_proj=wp_ref)
+    out_new = new_path(q_new, k_new, v_new, L, fmap, cache_size, block_m,
+                       block_n, x=x_new, w_proj=wp_new)
     report("out", out_new, out_ref, FWD_RTOL, FWD_ATOL)
 
     dout = seeded_randn_like(out_ref, dout_seed)
-    dq_ref, dk_ref, dv_ref = grads(out_ref, q_ref, k_ref, v_ref, dout)
-    dq_new, dk_new, dv_new = grads(out_new, q_new, k_new, v_new, dout)
-    for nm, g, x in [("dq_ref", dq_ref, q), ("dk_ref", dk_ref, k),
-                     ("dv_ref", dv_ref, v), ("dq_new", dq_new, q),
-                     ("dk_new", dk_new, k), ("dv_new", dv_new, v)]:
-        check_tensor(nm, g, x.shape)
+    dx_ref = dwp_ref = dx_new = dwp_new = None
+    if linear:
+        # q/k/v are all still consumed (q by attention, k/v by the tree),
+        # so allow_unused=False remains valid with the extended leaf set.
+        dq_ref, dk_ref, dv_ref, dx_ref, dwp_ref = torch.autograd.grad(
+            out_ref, (q_ref, k_ref, v_ref, x_ref, wp_ref), dout)
+        dq_new, dk_new, dv_new, dx_new, dwp_new = torch.autograd.grad(
+            out_new, (q_new, k_new, v_new, x_new, wp_new), dout)
+    else:
+        dq_ref, dk_ref, dv_ref = grads(out_ref, q_ref, k_ref, v_ref, dout)
+        dq_new, dk_new, dv_new = grads(out_new, q_new, k_new, v_new, dout)
+    checks = [("dq_ref", dq_ref, q), ("dk_ref", dk_ref, k),
+              ("dv_ref", dv_ref, v), ("dq_new", dq_new, q),
+              ("dk_new", dk_new, k), ("dv_new", dv_new, v)]
+    if linear:
+        checks += [("dx_ref", dx_ref, x), ("dw_proj_ref", dwp_ref, w_proj),
+                   ("dx_new", dx_new, x), ("dw_proj_new", dwp_new, w_proj)]
+    for nm, g, t in checks:
+        check_tensor(nm, g, t.shape)
     report("dq", dq_new, dq_ref)
     report("dk", dk_new, dk_ref)
     report("dv", dv_new, dv_ref)
+    if linear:
+        report("dx", dx_new, dx_ref)
+        report("dw_proj", dwp_new, dwp_ref)
 
     # ---- summary-weight path experiment: detach w (gradient-only) ----
     q_rd, k_rd, v_rd = leaves(q, k, v)
     q_nd, k_nd, v_nd = leaves(q, k, v)
     out_ref_det = reference_path(q_rd, k_rd, v_rd, merge_plan, sel_level,
-                                 sel_index, detach_weights=True)
+                                 sel_index, detach_weights=True,
+                                 x=x, w_proj=w_proj)
     out_new_det = new_path(q_nd, k_nd, v_nd, L, fmap, cache_size, block_m,
-                           block_n, detach_weights=True)
+                           block_n, detach_weights=True,
+                           x=x, w_proj=w_proj)
     # 1. detach is strictly gradient-only: forward values unchanged.
     torch.testing.assert_close(out_ref_det, out_ref, rtol=0, atol=0)
     torch.testing.assert_close(out_new_det, out_new, rtol=0, atol=0)
@@ -205,22 +241,43 @@ def part1_end_to_end(q, k, v, merge_plan, sel_level, sel_index, L, fmap,
     torch.testing.assert_close(dk_nd, dk_rd, rtol=GRAD_RTOL, atol=GRAD_ATOL)
     torch.testing.assert_close(dv_nd, dv_rd, rtol=GRAD_RTOL, atol=GRAD_ATOL)
     # 3. the w path carries gradient (correctness, not magnitude), and the
-    #    isolated contributions agree between the two implementations.
-    dq_w, dk_w = dq_ref - dq_rd, dk_ref - dk_rd
-    for nm, g in [("dq_w", dq_w), ("dk_w", dk_w)]:
-        if not bool(torch.isfinite(g).all().item()):
-            raise AssertionError(f"{nm}: non-finite")
-        if g.norm().item() <= W_PATH_MIN_NORM:
-            raise AssertionError(
-                f"{nm}: norm {g.norm().item():.3e} <= {W_PATH_MIN_NORM}; "
-                f"the summary-weight path carries no gradient")
-    report("dq_w", dq_new - dq_nd, dq_w)
-    report("dk_w", dk_new - dk_nd, dk_w)
+    #    isolated contributions agree between the two implementations. In
+    #    linear mode w does not depend on q/k: dq/dk are detach-invariant
+    #    and the w-path gradient flows into x/w_proj instead.
+    if linear:
+        torch.testing.assert_close(dq_rd, dq_ref, rtol=0, atol=1e-7)
+        torch.testing.assert_close(dk_rd, dk_ref, rtol=0, atol=1e-7)
+        for nm, g in [("dx_ref", dx_ref), ("dw_proj_ref", dwp_ref)]:
+            if not bool(torch.isfinite(g).all().item()):
+                raise AssertionError(f"{nm}: non-finite")
+            if g.norm().item() <= W_PATH_MIN_NORM:
+                raise AssertionError(
+                    f"{nm}: norm {g.norm().item():.3e} <= {W_PATH_MIN_NORM}; "
+                    f"the summary-weight path carries no gradient")
+    else:
+        dq_w, dk_w = dq_ref - dq_rd, dk_ref - dk_rd
+        for nm, g in [("dq_w", dq_w), ("dk_w", dk_w)]:
+            if not bool(torch.isfinite(g).all().item()):
+                raise AssertionError(f"{nm}: non-finite")
+            if g.norm().item() <= W_PATH_MIN_NORM:
+                raise AssertionError(
+                    f"{nm}: norm {g.norm().item():.3e} <= {W_PATH_MIN_NORM}; "
+                    f"the summary-weight path carries no gradient")
+        report("dq_w", dq_new - dq_nd, dq_w)
+        report("dk_w", dk_new - dk_nd, dk_w)
     # 4. dv is exactly unaffected by w (w does not depend on v and enters
     #    only through the K/V mixing weights). atol guards CUDA reduction
     #    nondeterminism only; on CPU this is bitwise.
     torch.testing.assert_close(dv_rd, dv_ref, rtol=0, atol=1e-7)
     torch.testing.assert_close(dv_nd, dv_new, rtol=0, atol=1e-7)
+    if linear:
+        print(
+            f"  {'w-path':<16} det-fwd-equal ✓ det-agree ✓ dv-invariant ✓ "
+            f"dq/dk-invariant ✓ "
+            f"|dx|={dx_ref.norm().item():.2e} "
+            f"|dw_proj|={dwp_ref.norm().item():.2e}"
+        )
+        return dout, (dq_ref, dk_ref, dv_ref, dx_ref, dwp_ref)
     print(
         f"  {'w-path':<16} det-fwd-equal ✓ det-agree ✓ dv-invariant ✓ "
         f"|dq_w|={dq_w.norm().item():.2e} "
@@ -282,9 +339,14 @@ def part2_phase2(tag, q, packed, fmap, cache_size, block_m, block_n, softcap,
 # ----------------------------------------------------------------------------
 
 def part3_composition(q, k, v, L, fmap, cache_size, block_m, block_n, dout,
-                      oracle_grads):
+                      oracle_grads, weight_mode="qk", x=None, w_proj=None):
+    linear = weight_mode == "linear"
     q_l, k_l, v_l = leaves(q, k, v)
-    kl_g, vl_g, _ = build_dyadic_summaries(q_l, k_l, v_l, L)
+    if linear:
+        x_l, wp_l = linear_leaves(x, w_proj)
+    else:
+        x_l = wp_l = None
+    kl_g, vl_g, _ = build_dyadic_summaries(q_l, k_l, v_l, L, x=x_l, w_proj=wp_l)
     packed_g = pack_levels(kl_g, vl_g)  # graph intact
     with torch.no_grad():
         out, lse = multilevel_attention_forward(
@@ -292,12 +354,25 @@ def part3_composition(q, k, v, L, fmap, cache_size, block_m, block_n, dout,
     dq_attn, dk_p, dv_p, _ = multilevel_attention_backward(
         q_l, packed_g, out, lse, dout, fmap, cache_size,
         block_m=block_m, block_n=block_n)
-    dq_tree, dk_tree, dv_tree = torch.autograd.grad(
-        (packed_g.k, packed_g.v), (q_l, k_l, v_l), (dk_p, dv_p))
-    dq_ref, dk_ref, dv_ref = oracle_grads
-    report("dq-e2e", dq_attn + dq_tree, dq_ref)
-    report("dk-e2e", dk_tree, dk_ref)
-    report("dv-e2e", dv_tree, dv_ref)
+    if linear:
+        # The tree graph never touches q (w comes from x/w_proj), so q_l is
+        # excluded from the VJP leaf set (allow_unused=False would raise)
+        # and dq_tree is identically zero.
+        dk_tree, dv_tree, dx_tree, dwp_tree = torch.autograd.grad(
+            (packed_g.k, packed_g.v), (k_l, v_l, x_l, wp_l), (dk_p, dv_p))
+        dq_ref, dk_ref, dv_ref, dx_ref, dwp_ref = oracle_grads
+        report("dq-e2e", dq_attn, dq_ref)
+        report("dk-e2e", dk_tree, dk_ref)
+        report("dv-e2e", dv_tree, dv_ref)
+        report("dx-e2e", dx_tree, dx_ref)
+        report("dw_proj-e2e", dwp_tree, dwp_ref)
+    else:
+        dq_tree, dk_tree, dv_tree = torch.autograd.grad(
+            (packed_g.k, packed_g.v), (q_l, k_l, v_l), (dk_p, dv_p))
+        dq_ref, dk_ref, dv_ref = oracle_grads
+        report("dq-e2e", dq_attn + dq_tree, dq_ref)
+        report("dk-e2e", dk_tree, dk_ref)
+        report("dv-e2e", dv_tree, dv_ref)
 
 
 # ----------------------------------------------------------------------------
@@ -306,7 +381,7 @@ def part3_composition(q, k, v, L, fmap, cache_size, block_m, block_n, dout,
 
 def run_case(name, *, B, N, Hq, Hkv, Dk, Dv, cache_size, fmap, block_m,
              block_n, device, seed=0, dtype=torch.float32,
-             softcap_none_too=False, **_ignored):
+             softcap_none_too=False, weight_mode="qk", **_ignored):
     print(
         f"\n=== {name}: B={B} N={N} Hq={Hq} Hkv={Hkv} Dk={Dk} Dv={Dv} "
         f"cache={cache_size} fmap={fmap} BLOCK_M={block_m} "
@@ -319,6 +394,16 @@ def run_case(name, *, B, N, Hq, Hkv, Dk, Dv, cache_size, fmap, block_m,
     k = torch.randn(B, N, Hkv, Dk, device=device, dtype=dtype)
     v = torch.randn(B, N, Hkv, Dv, device=device, dtype=dtype)
 
+    # Identical formulas and draw order as test_forward.run_case, so the
+    # same seed produces the same tensors across both suites.
+    x = w_proj = None
+    if weight_mode == "linear":
+        emb_dim = Hq * Dk
+        x = torch.randn(B, N, emb_dim, device=device, dtype=dtype)
+        w_proj = torch.randn(
+            Hkv, emb_dim, device=device, dtype=dtype
+        ) / emb_dim ** 0.5
+
     spec = RangeSpec.from_fmap(fmap, cache_size, N)
     L = spec.num_levels - 1
     merge_plan, sel_level, sel_index = get_structured_plan(N, fmap, cache_size, device)
@@ -327,11 +412,12 @@ def run_case(name, *, B, N, Hq, Hkv, Dk, Dv, cache_size, fmap, block_m,
     print("-- part 1: end-to-end autograd oracle")
     dout, oracle_grads = part1_end_to_end(
         q, k, v, merge_plan, sel_level, sel_index, L, fmap, cache_size,
-        block_m, block_n, dout_seed=seed + 1)
+        block_m, block_n, dout_seed=seed + 1,
+        weight_mode=weight_mode, x=x, w_proj=w_proj)
 
     print("-- part 2: explicit Phase-2 backward at the packed boundary")
     with torch.no_grad():
-        kl, vl, _ = build_dyadic_summaries(q, k, v, L)
+        kl, vl, _ = build_dyadic_summaries(q, k, v, L, x=x, w_proj=w_proj)
         packed = pack_levels(kl, vl)
     part2_phase2("", q, packed, fmap, cache_size, block_m, block_n, 20.0,
                  spec, dout_seed=seed + 2)
@@ -341,7 +427,7 @@ def run_case(name, *, B, N, Hq, Hkv, Dk, Dv, cache_size, fmap, block_m,
 
     print("-- part 3: explicit Phase 2 + autograd Phase-1 VJP vs oracle")
     part3_composition(q, k, v, L, fmap, cache_size, block_m, block_n, dout,
-                      oracle_grads)
+                      oracle_grads, weight_mode=weight_mode, x=x, w_proj=w_proj)
     print(f"\n[{name}] PASS")
 
 

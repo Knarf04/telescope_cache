@@ -171,9 +171,9 @@ class MultiHeadAttention(nn.Module):
         self.fmap = fmap
         self.cache_size = 512 #256
 
-        self.weighted = True
-        # if self.weighted:
-        #     self.w = nn.Linear(self.emb_dim, self.kvheads, bias=False)
+        self.weight_mode = "qk"  # "qk" | "linear" | None (unweighted scan)
+        if self.weight_mode == "linear":
+            self.w = nn.Linear(self.emb_dim, self.kvheads, bias=False)
 
         self.mask = None
 
@@ -308,8 +308,16 @@ class MultiHeadAttention(nn.Module):
         expansion = self.nheads // self.kvheads
         queries = queries.unflatten(2, (self.kvheads, expansion))  # b l h e d
         w = None
-        if self.weighted:
+        if self.weight_mode == "linear":
+            # `k` is the PRE-projection hidden state [b, l, emb_dim]
+            # (rebound to the raw q input above when is_self=True).
+            # TODO: fms/inference.py still derives w from QK logits; a model
+            # trained with linear weights mismatches at inference until it
+            # grows the same mode.
+            w = self.w(k).unsqueeze(-1)  # b l h 1
+        elif self.weight_mode == "qk":
             w = queries.div(self.emb_kq_per_head**0.5).matmul(keys.unsqueeze(-1)).squeeze(-1).logsumexp(-1, True)  # b l h 1
+
         keys = self.scan(keys, self.plan, w)  # b n h d
         values = self.scan(values, self.plan, w)  # b n h d
 

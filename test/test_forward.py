@@ -1,8 +1,9 @@
 import argparse
+import copy
 import math
 import os
 import sys
-from typing import Dict, List
+from typing import Dict, List, Optional
 
 import torch
 
@@ -20,6 +21,7 @@ from telescope_cache.range_spec import (  # noqa: E402
 from telescope_cache.reference import (  # noqa: E402
     PackedKV,  # noqa: F401  (re-exported for test_backward.py)
     build_dyadic_summaries,
+    compute_linear_weights,
     compute_summary_weights,
     multilevel_attention_forward,
     pack_levels,
@@ -125,6 +127,8 @@ def build_plan_based_summaries(
     v: torch.Tensor,
     merge_plan: List[torch.Tensor],
     detach_weights: bool = False,
+    x: Optional[torch.Tensor] = None,
+    w_proj: Optional[torch.Tensor] = None,
 ):
     """
     Exact level-major analogue of the original weighted scan().
@@ -135,11 +139,22 @@ def build_plan_based_summaries(
     detach_weights: gradient-only switch used by test_backward.py. Detaching
     the leaf weights w cuts the entire merge-weight gradient branch at every
     level while leaving all forward values unchanged.
+
+    x/w_proj: same weight-mode switch as build_dyadic_summaries (must use the
+    same reference functions so both paths get bitwise-identical w).
     """
     B, N, _, _ = q.shape
     Hkv = k.shape[2]
 
-    w = compute_summary_weights(q, k)
+    if (x is None) != (w_proj is None):
+        raise ValueError(
+            "x and w_proj must both be provided (linear weight mode) or "
+            "both be None (QK weight mode)"
+        )
+    if x is not None:
+        w = compute_linear_weights(x, w_proj)
+    else:
+        w = compute_summary_weights(q, k)
     if detach_weights:
         w = w.detach()
 
@@ -1265,7 +1280,7 @@ def run_case(
     *,
     B, N, Hq, Hkv, Dk, Dv, cache_size, fmap, block_m, block_n,
     expect, device, golden_ranges=None, seed=0,
-    dtype=torch.float32,
+    dtype=torch.float32, weight_mode="qk",
 ):
     print(
         f"\n=== {name}: B={B} N={N} Hq={Hq} Hkv={Hkv} Dk={Dk} Dv={Dv} "
@@ -1283,6 +1298,18 @@ def run_case(
     k = torch.randn(B, N, Hkv, Dk, device=device, dtype=dtype)
     v = torch.randn(B, N, Hkv, Dv, device=device, dtype=dtype)
 
+    # Linear weight mode: hidden states + projection replacing the QK
+    # weighting. Draw order matters: test_backward.py reuses the same seed
+    # and formulas so failures reproduce across suites. The 1/sqrt(emb_dim)
+    # scale keeps w ~ O(1) so the pair softmax is not saturated.
+    x = w_proj = None
+    if weight_mode == "linear":
+        emb_dim = Hq * Dk
+        x = torch.randn(B, N, emb_dim, device=device, dtype=dtype)
+        w_proj = torch.randn(
+            Hkv, emb_dim, device=device, dtype=dtype
+        ) / emb_dim ** 0.5
+
     # --------------------------------------------------------
     # Original selection/merge plan and level-major reference summaries.
     # --------------------------------------------------------
@@ -1290,7 +1317,7 @@ def run_case(
         N, fmap, cache_size, device
     )
     old_k_levels, old_v_levels, _, old_valid_levels = (
-        build_plan_based_summaries(q, k, v, merge_plan)
+        build_plan_based_summaries(q, k, v, merge_plan, x=x, w_proj=w_proj)
     )
 
     # --------------------------------------------------------
@@ -1299,7 +1326,7 @@ def run_case(
     # --------------------------------------------------------
     num_summary_levels = len(merge_plan) - 2
     dyadic_k_levels, dyadic_v_levels, _ = build_dyadic_summaries(
-        q, k, v, num_summary_levels
+        q, k, v, num_summary_levels, x=x, w_proj=w_proj
     )
     dyadic_select_level, dyadic_select_index, old_to_dyadic = (
         remap_plan_to_dyadic(merge_plan, select_level, select_index, N)
@@ -1546,6 +1573,15 @@ CASES = [
         golden_ranges=README_TINY_GOLDEN,
     ),
 ]
+
+# Trained-linear weight-mode variants: identical geometry (expect and
+# golden_ranges are w-independent), only the Phase-1 merge weights differ.
+for _base in ("baseline", "readme_tiny"):
+    _c = copy.deepcopy(next(c for c in CASES if c["name"] == _base))
+    _c["name"] = _base + "_linear"
+    _c["weight_mode"] = "linear"
+    CASES.append(_c)
+del _base, _c
 
 
 def main(argv=None):

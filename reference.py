@@ -15,6 +15,7 @@ Pipeline
 --------
     q, k, v
       -> compute_summary_weights          w = LSE_h(q_h.k / sqrt(Dk))   [Phase 1]
+         (or compute_linear_weights       w = x.w_proj^T, trained mode)
       -> build_dyadic_summaries           canonical dyadic K/V tree
       -> pack_levels                      one level-major buffer per tensor
       -> multilevel_attention_forward     (out, lse)                    [Phase 2]
@@ -33,7 +34,7 @@ pack_levels, _packed_slice/_kv_tile and the packed-geometry test only.
 """
 
 import math
-from typing import Dict, List, NamedTuple, Tuple
+from typing import Dict, List, NamedTuple, Optional, Tuple
 
 import torch
 
@@ -47,6 +48,7 @@ from telescope_cache.range_spec import (
 __all__ = [
     "PackedKV",
     "compute_summary_weights",
+    "compute_linear_weights",
     "build_dyadic_summaries",
     "pack_levels",
     "multilevel_attention_forward",
@@ -89,12 +91,33 @@ def compute_summary_weights(
     return torch.logsumexp(scores, dim=3, keepdim=True)
 
 
+def compute_linear_weights(
+    x: torch.Tensor,
+    w_proj: torch.Tensor,
+) -> torch.Tensor:
+    """
+    x: [B, N, emb_dim]   w_proj: [Hkv, emb_dim]   ->   w: [B, N, Hkv, 1]
+
+    Trained-linear alternative to compute_summary_weights. Matches
+    nn.Linear(emb_dim, Hkv, bias=False) applied to hidden states:
+    w = x @ w_proj^T. Unlike the QK mode, w does not depend on q or k.
+    """
+    B, N, E = x.shape
+    Hkv, Ew = w_proj.shape
+
+    assert E == Ew
+
+    return x.matmul(w_proj.t()).unsqueeze(-1)
+
+
 def build_dyadic_summaries(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
     num_summary_levels: int,
     detach_weights: bool = False,
+    x: Optional[torch.Tensor] = None,
+    w_proj: Optional[torch.Tensor] = None,
 ):
     """
     Build a canonical dyadic K/V summary tree directly.
@@ -112,10 +135,29 @@ def build_dyadic_summaries(
     exactly the set of complete aligned dyadic intervals available at the
     next level.
 
+    Weight mode: with x and w_proj both None (default), merge weights come
+    from compute_summary_weights(q, k) (QK mode). With both given, they come
+    from compute_linear_weights(x, w_proj) (trained-linear mode) and do not
+    depend on q or k. Providing exactly one raises.
+
     detach_weights: gradient-only switch (forward values unchanged) that cuts
-    the q/k -> w -> merge-weight gradient branch; used by test_backward.py.
+    the w -> merge-weight gradient branch (q/k in QK mode, x/w_proj in linear
+    mode); used by test_backward.py.
     """
-    w = compute_summary_weights(q, k)
+    if (x is None) != (w_proj is None):
+        raise ValueError(
+            "x and w_proj must both be provided (linear weight mode) or "
+            "both be None (QK weight mode)"
+        )
+    if x is not None:
+        w = compute_linear_weights(x, w_proj)
+        expected = (k.shape[0], k.shape[1], k.shape[2], 1)
+        if tuple(w.shape) != expected:
+            raise ValueError(
+                f"linear weights shape {tuple(w.shape)} != {expected}"
+            )
+    else:
+        w = compute_summary_weights(q, k)
     if detach_weights:
         w = w.detach()
 
