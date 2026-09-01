@@ -18,6 +18,20 @@ TODOs:
 | `test/test_forward.py` | Historical oracles (original scan plan, dense flattened-mask reference, loop POCs, analytic range oracles) and the six-configuration forward chain checking `reference.multilevel_attention_forward` — `out` and `lse` — against all of them, with coverage assertions (warm-up, eviction, odd lengths, partial tiles, `Dv≠Dk`, GQA). Defines `CASES`. |
 | `test/test_backward.py` | Part 1: end-to-end autograd gradient oracle (original chain vs `reference.py`, incl. the `q/k → w →` summary-tree path, `detach_weights`, `dv` invariance). Part 2: `reference.multilevel_attention_backward` vs autograd at the packed boundary (saved-LSE reconstruction, softcap derivative, never-visible nodes, conservative-hull tile). Part 3: explicit Phase 2 + autograd Phase-1 VJP ≡ Part-1 oracle. |
 | `test/test_range.py` | Exhaustive property tests of `range_spec` at small N against the analytic range oracles. |
+| `cute/ranges.py` | Branch-free closed forms of `range_spec` (`+ - * >> min max` only, no data-dependent `if`), so one source runs on host ints, torch tensors and CuTeDSL Int32. Replaces `fwd_bounds`' block scan with an O(1) hull. |
+| `cute/packing.py` | Block-aligned level-major K/V: each level padded (with **zeros**) up to a multiple of `tile_n`, so a level-local tile index is a compile-time offset from the level's block base and no K/V copy needs seqlen predication. |
+| `cute/flash_fwd_telescope.py` | **The kernel.** FA4's `FlashAttentionForwardSm80` with the block schedule and the mask replaced; loads, GEMMs, online softmax and epilogue inherited. Introduces the *virtual block index* so FA4's contiguous-descending pipeline can drive a union of L+1 disjoint block ranges. |
+| `cute/flash_bwd_telescope.py` | **The backward kernel.** FA4's `FlashAttentionBackwardSm80` with the same two regions replaced. One KV-owned pass (dK/dV in registers, dQ scattered into an fp32 accumulator) rather than the reference's two explicit passes; only the Pass-B direction of the range spec is needed, and no virtual index, because a KV tile's query range is a single contiguous interval. |
+| `cute/interface.py` | Host entry point for both directions: builds cute tensors, instantiates kernels specialized to one schedule, compiles once per configuration. Forward: `telescope_attn_packed` (fast path) and `telescope_attn_func` (drop-in for the reference). Backward: `telescope_attn_bwd`, including the preprocess/postprocess plumbing FA4 leaves unfinished on Ampere. |
+| `cute/mask_mod.py` | Baseline GPU path: the same semantics as a FlashAttention-4 `mask_mod` over the packed buffer. Correctness cross-check and the performance floor to beat -- it walks every key block, the kernel walks only the selected ones. |
+| `test/test_cute_ranges.py` | `cute/ranges.py` vs `range_spec` exhaustively over every (query, level) in nine schedules, plus hull containment over five `BLOCK_M` values. |
+| `test/test_cute_forward.py` | GPU forward: both CuTeDSL paths vs `reference.multilevel_attention_forward`, scored against the bf16 rounding floor so dtype error is not read as kernel error. |
+| `test/test_cute_backward.py` | GPU backward: the kernel vs `reference.multilevel_attention_backward` at the packed boundary, fed the forward's saved LSE, scored against the bf16 floor. Also asserts the K/V padding receives exactly zero dK/dV. |
+| `test/flex_baseline.py` | `fms/train.py`'s FlexAttention path isolated to attention alone. Imports `get_scan_plan` and `scan` from `fms/train.py` rather than reimplementing them; the cache build, dense mask, `create_block_mask` and `soft_cap` are copied verbatim from `MultiHeadAttention.forward`. |
+| `test/test_flex_equivalence.py` | Anchors the equivalence chain to the code that actually trains: `train.py`'s flex path vs `reference.multilevel_attention_forward` vs the kernel. Checks the selection (mask row sums == `\|A(q)\|` from `range_spec`) separately from the values. |
+| `test/bench_forward.py` | Forward benchmark: telescope kernel vs the `fms/train.py` flex baseline, FA4 `mask_mod`, sliding window of `cache_size`, dense causal, and a dense N x cache_size floor. |
+| `test/analyze_tiles.py` | Host-side tile-occupancy model (no GPU): useful lanes vs lanes the MMA actually computes, per (tile_m, tile_n) and per level. Explains where the kernel's time goes and bounds what tuning can buy. |
+| `test/sweep_tiles.py` | GPU sweep of (tile_m, tile_n, num_threads) validating that model. |
 
 For kernel work: `reference.py` + `range_spec.py` define **what to implement**;
 the test files define **what must still pass**. The oracle implementations in
@@ -28,6 +42,83 @@ Run everything (CPU, from `test/`):
 ```bash
 python test_range.py && python test_forward.py --device cpu && python test_backward.py --device cpu
 ```
+
+Kernel work (needs a CUDA device and `flash_attn_4`; from `test/`):
+
+```bash
+python test_cute_ranges.py                 # CPU, no GPU needed
+python test_cute_forward.py                # fwd kernel + mask_mod vs the reference
+python test_cute_backward.py               # bwd kernel vs the reference
+python test_flex_equivalence.py            # vs fms/train.py's flex_attention
+python analyze_tiles.py                    # CPU: where the work goes
+python bench_forward.py                    # timings
+python sweep_tiles.py                      # tile tuning
+```
+
+Two things about FA4 on Ampere that shaped the design:
+
+* **Sliding-window block skipping is not implemented on SM80.** `flash_fwd.py`
+  computes `n_block_min` and then loops to block 0 anyway (`# TODO: local`
+  is on the line after). Measured: at N=8192 the runtime is the same for
+  windows of 127 and 4095 and for full causal. So FA4's own SWA is O(N^2)
+  here; do not read the telescope-vs-SWA ratio as an algorithmic result.
+* **The backward refuses Ampere and its arch-8 host path has never run** --
+  `_flash_attn_bwd` asserts capability in {9,10,11,12}, and past the assert
+  it dies on `UnboundLocalError: dQ_single_wg`. The *kernel* is fine; it
+  reproduces a float32 torch reference on sm86 when driven directly, which
+  is why `cute/interface.py` carries its own backward launcher.
+
+`flash_attn_4` is the FlashAttention-4 CuTeDSL package. It is a pure-Python
+wheel (all kernels are JIT-compiled through CuTeDSL, nothing is prebuilt per
+arch) published on the flash-attention releases page, not on PyPI:
+
+```bash
+pip install https://github.com/Dao-AILab/flash-attention/releases/download/fa4-v4.0.0.beta28/flash_attn_4-4.0.0b28-py3-none-any.whl
+```
+
+Despite the name, FA4 is not Blackwell-only: `interface.py` dispatches
+compute capability 8.x to a generic SM80 kernel (`flash_fwd.py`), which is
+what the telescope kernel derives from and what runs here on sm86. The
+Hopper/Blackwell-specific files (`flash_fwd_sm90.py`, `flash_fwd_sm100.py`)
+are separate; porting the telescope schedule to them is future work.
+
+## Using the kernels
+
+```python
+from telescope_cache.cute.interface import (
+    BWD_N_BLOCK, telescope_attn_packed, telescope_attn_bwd,
+)
+from telescope_cache.cute.packing import pack_levels_aligned
+from telescope_cache.cute.ranges import coarsest_lifetime_span
+from telescope_cache.range_spec import RangeSpec
+from telescope_cache.reference import build_dyadic_summaries
+
+spec = RangeSpec.from_fmap(fmap, cache_size, N)
+k_levels, v_levels, _ = build_dyadic_summaries(q, k, v, max(fmap))
+
+# Pack ONCE, at the backward's block size. The forward may run at a finer
+# tile_n inside the same buffer -- all it needs is that every level start on
+# one of its block boundaries, and 64-aligned offsets are also 16-aligned.
+packed = pack_levels_aligned(k_levels, v_levels, tile_n=BWD_N_BLOCK)
+
+out, lse = telescope_attn_packed(q, packed, spec.activation_times, cache_size)
+dq, dk, dv = telescope_attn_bwd(
+    q, packed, out, lse, dout,
+    spec.activation_times, cache_size,
+    coarsest_span=coarsest_lifetime_span(spec),
+)
+```
+
+`lse` is the forward's saved natural-log value and must be passed to the
+backward unchanged, never recomputed -- the same contract `reference.py`
+states. `dk`/`dv` come back in the padded packed layout; slice them per level
+with `packed.pad_offsets`, and feed them as VJP seeds into the Phase-1 graph
+exactly as `multilevel_attention_backward`'s docstring describes. The padding
+rows are zero, because every padded column is masked.
+
+Both directions are specialized at compile time to one
+`(activation_times, cache_size, pad_offsets)` triple, so each distinct
+schedule compiles its own kernel and they are cached per configuration.
 
 ## Flattened cache vs. dyadic tree
 
