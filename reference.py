@@ -24,7 +24,8 @@ Pipeline
           summary tree is position-independent in every mode)
       -> apply_attention_sink (optional)  out * sigmoid(lse - sinks)
       -> apply_output_gate (optional)     SiLU(x.gate_w^T) * out
-      -> multilevel_attention_backward    (dq, dk_packed, dv_packed)    [Phase 2]
+      -> multilevel_attention_backward    (dq, dk_packed, dv_packed,
+                                           dposition, stats)            [Phase 2]
 
 Phase-1 backward (gradients of packed K/V back to raw q, k, v, including the
 q/k -> w -> merge-weight path) is left to autograd; see test_backward.py.
@@ -231,6 +232,7 @@ def apply_rope(
     positions: torch.Tensor,
     cos: torch.Tensor,
     sin: torch.Tensor,
+    inverse: bool = False,
 ) -> torch.Tensor:
     """
     x: [..., D]   positions: integer tensor broadcastable to x.shape[:-1]
@@ -239,8 +241,10 @@ def apply_rope(
     Orthogonal per-position rotation (rotate-half), computed in FP32 and
     cast back. Norm-preserving.
 
-    TODO(kernel): the backward of an orthogonal rotation is the inverse
-    rotation -- rotate dQ/dK back by -theta; autograd handles it here.
+    inverse=True rotates by -theta, i.e. applies R(p)^T = R(p)^{-1} = R(-p):
+    the mathematical VJP of the forward rotation. The explicit Phase-2
+    backward uses it to rotate accumulated dQ/dK back out of rotated space
+    (multilevel_attention_backward, position_mode="rope").
     """
     if cos.shape != sin.shape:
         raise ValueError(
@@ -253,6 +257,8 @@ def apply_rope(
         )
     c = cos[positions]  # [..., D/2]
     s = sin[positions]
+    if inverse:
+        s = -s
     x_fp32 = x.float()
     x1, x2 = x_fp32[..., : D // 2], x_fp32[..., D // 2:]
     rotated = torch.cat([x1 * c - x2 * s, x2 * c + x1 * s], dim=-1)
@@ -350,6 +356,73 @@ def compute_relative_states(
             f"incompatible with emb_dim={E}, Hq={Hq}"
         )
     return x.matmul(relative_weight.t()).reshape(B, N, Hq, rows // Hq)
+
+
+def _tile_bin_distances(
+    spec: RangeSpec,
+    row_lo: torch.Tensor,
+    row_hi: torch.Tensor,
+    kv_indices: torch.Tensor,
+    level: int,
+    max_relative_bins: int,
+    valid: torch.Tensor,
+    q_start: int,
+    q_end: int,
+) -> torch.Tensor:
+    """
+    Vectorized relative_bin_distance for one query-block x KV tile.
+
+    row_lo/row_hi: [M, num_levels] per-row visible bounds for ALL levels
+    kv_indices:    [Kt] level-local entry indices at `level`
+    valid:         [M, Kt] tile-local elem_mask
+    ->             dist [M, Kt] long, the 0-based chronological bin distance.
+
+    Valid lanes must satisfy 0 <= dist < max_relative_bins; either violation
+    raises (no silent clamping -- a table with >= cache_size bins always
+    suffices, and a negative distance on a valid lane means broken range
+    invariants; negative indices could silently alias the tensor end).
+    Hull-only (invalid) lanes may carry negative distances -- callers clamp
+    their gather index to 0 and the element mask keeps them gradient-dead.
+    Shared by the forward and the explicit backward so both reconstruct
+    identical biases.
+    """
+    M = row_lo.shape[0]
+    t = kv_indices << level  # [Kt]
+    rank = torch.zeros(
+        M, t.shape[0], device=kv_indices.device, dtype=torch.long
+    )
+    for lp in range(spec.num_levels):
+        ceil_t = (
+            (t + (1 << lp) - 1) >> lp
+        )[None, :].expand(M, -1)
+        rank = rank + torch.maximum(
+            torch.minimum(ceil_t, row_hi[:, lp:lp + 1]),
+            row_lo[:, lp:lp + 1],
+        ) - row_lo[:, lp:lp + 1]
+    m_total = (row_hi - row_lo).sum(dim=1)  # [M]
+    dist = (m_total[:, None] - 1) - rank
+    bad = valid & (dist >= max_relative_bins)
+    if bool(bad.any()):
+        raise ValueError(
+            f"relative bin distance "
+            f"{int(dist[valid].max())} in query "
+            f"block [{q_start},{q_end}) at level "
+            f"{level} exceeds max_relative_bins="
+            f"{max_relative_bins}; no silent "
+            f"clamping -- a table with >= "
+            f"cache_size={spec.cache_size} bins "
+            f"always suffices"
+        )
+    bad_low = valid & (dist < 0)
+    if bool(bad_low.any()):
+        raise ValueError(
+            f"negative relative bin distance "
+            f"{int(dist[valid].min())} on a valid lane in query block "
+            f"[{q_start},{q_end}) at level {level}; range invariants "
+            f"guarantee 0 <= dist for visible entries, so this input is "
+            f"semantically broken"
+        )
+    return dist
 
 
 def build_dyadic_summaries(
@@ -788,7 +861,6 @@ def multilevel_attention_forward(
                     )[:, None]  # broadcast over E
                     Q = apply_rope(Q, q_pos, rope_cos, rope_sin)
                 elif position_mode == "relative":
-                    m_total = (row_hi - row_lo).sum(dim=1)  # [M]
                     rel_t = rel_logits[b, q_start:q_end, hq_slice]
 
                 m = torch.full(
@@ -850,38 +922,12 @@ def multilevel_attention_forward(
                         ) * scale
 
                         if position_mode == "relative":
-                            # 0-based chronological bin distance, the
-                            # vectorized relative_bin_distance: per level,
-                            # count visible entries starting before this
-                            # entry's interval start t.
-                            t = kv_indices << level  # [Ktile]
-                            Kt = k_end - k_start
-                            rank = torch.zeros(
-                                M, Kt, device=q.device, dtype=torch.long
+                            # 0-based chronological bin distance; shared
+                            # with the explicit backward.
+                            dist = _tile_bin_distances(
+                                spec, row_lo, row_hi, kv_indices, level,
+                                max_relative_bins, valid, q_start, q_end,
                             )
-                            for lp in range(spec.num_levels):
-                                ceil_t = (
-                                    (t + (1 << lp) - 1) >> lp
-                                )[None, :].expand(M, -1)
-                                rank = rank + torch.maximum(
-                                    torch.minimum(
-                                        ceil_t, row_hi[:, lp:lp + 1]
-                                    ),
-                                    row_lo[:, lp:lp + 1],
-                                ) - row_lo[:, lp:lp + 1]
-                            dist = (m_total[:, None] - 1) - rank
-                            bad = valid & (dist >= max_relative_bins)
-                            if bool(bad.any()):
-                                raise ValueError(
-                                    f"relative bin distance "
-                                    f"{int(dist[valid].max())} in query "
-                                    f"block [{q_start},{q_end}) at level "
-                                    f"{level} exceeds max_relative_bins="
-                                    f"{max_relative_bins}; no silent "
-                                    f"clamping -- a table with >= "
-                                    f"cache_size={spec.cache_size} bins "
-                                    f"always suffices"
-                                )
                             # Hull-only (invalid) lanes may have dist < 0:
                             # clamp their gather index to 0; the -inf mask
                             # below kills any gradient into those bins.
@@ -1040,7 +1086,7 @@ def attention_sink_backward(
     Composition with the explicit Phase-2 backward:
 
         dout_pre, dlse, dsinks = attention_sink_backward(out, lse, sinks, g)
-        dq, dk_p, dv_p, _ = multilevel_attention_backward(
+        dq, dk_p, dv_p, _, _ = multilevel_attention_backward(
             q, packed, out, lse, dout_pre, fmap, cache_size, dlse=dlse)
     """
     B, N, Hq, Dv = out.shape
@@ -1112,7 +1158,8 @@ def apply_output_gate(
 #   Pass B (KV-owned dK/dV): K-tile --bwd_bounds--> Q-tiles
 #
 # Per Q x K tile (all FP32):
-#   X  = Q K^T * scale                     scale = 1/sqrt(Dk)
+#   X  = Q K^T * scale [+ b]               scale = 1/sqrt(Dk); b only in
+#                                          relative mode (pre-softcap bias)
 #   S  = c*tanh(X/c)  (softcap=c) | X      softcap_grad = 1 - tanh(X/c)^2 | 1
 #   P  = exp(S - LSE_q) on valid (q,k), else 0     <- SAVED forward lse
 #   Delta_q     = sum_d dO_qd O_qd                 <- computed once
@@ -1122,6 +1169,7 @@ def apply_output_gate(
 #   dV += P^T dO      dP = dO V^T      dS = P * (dP - Delta_eff)
 #   dX  = dS * softcap_grad
 #   dQ += scale * dX K                 dK += scale * dX^T Q
+#   db  = dX (X affine in b): Pass A scatter-adds dX into each row's bins
 #
 # The hulls from fwd_bounds / bwd_bounds (and BLOCK_M alignment of the
 # latter) are conservative; the tile-local element mask is exact, so
@@ -1131,18 +1179,34 @@ def apply_output_gate(
 # ============================================================
 
 def _tile_grads(
-    Q, K, V, dO, lse_t, delta_t, valid, scale, softcap, *, need_dq, need_dkv
+    Q, K, V, dO, lse_t, delta_t, valid, scale, softcap, *, need_dq, need_dkv,
+    bias=None, need_dbias=False,
 ):
     """
     Shared per-tile backward math for both passes.
 
     Q [M,E,Dk]  K [Kt,Dk]  V [Kt,Dv]  dO [M,E,Dv]  lse_t/delta_t [M,E]
     valid [M,Kt] (tile-local elem_mask, vectorized)
-    Returns (dQ [M,E,Dk] | None, dK [Kt,Dk] | None, dV [Kt,Dv] | None), FP32.
+    bias [M,E,Kt] fp32 | None: additive pre-softcap score bias (the
+    forward's relative mode: X = QK*scale + bias). Since X is affine in
+    the bias, its gradient is exactly dX -- returned as dBias when
+    need_dbias (already zeroed on invalid lanes). Invalid-lane bias values
+    are irrelevant: the P reconstruction overrides them with -inf.
+    Returns (dQ [M,E,Dk] | None, dK [Kt,Dk] | None, dV [Kt,Dv] | None,
+    dBias [M,E,Kt] | None), FP32.
     """
+    if need_dbias and bias is None:
+        raise ValueError("need_dbias=True requires bias")
     Qf, Kf, Vf, dOf = Q.float(), K.float(), V.float(), dO.float()
 
     x = torch.einsum("med,kd->mek", Qf, Kf) * scale
+    if bias is not None:
+        if bias.shape != x.shape:
+            raise ValueError(
+                f"bias shape {tuple(bias.shape)} != scores shape "
+                f"{tuple(x.shape)}"
+            )
+        x = x + bias
     if softcap is not None:
         t = torch.tanh(x / softcap)
         s = softcap * t
@@ -1169,7 +1233,8 @@ def _tile_grads(
     dQ = scale * torch.einsum("mek,kd->med", dX, Kf) if need_dq else None
     dK = scale * torch.einsum("mek,med->kd", dX, Qf) if need_dkv else None
     dV = torch.einsum("mek,med->kd", p, dOf) if need_dkv else None
-    return dQ, dK, dV
+    dBias = dX if need_dbias else None
+    return dQ, dK, dV, dBias
 
 
 @torch.no_grad()
@@ -1187,17 +1252,43 @@ def multilevel_attention_backward(
     *,
     dlse: Optional[torch.Tensor] = None,
     position_mode: str = "none",
+    rope_cos: Optional[torch.Tensor] = None,
+    rope_sin: Optional[torch.Tensor] = None,
+    relative_states: Optional[torch.Tensor] = None,
+    relative_proj: Optional[torch.Tensor] = None,
 ):
     """
     Explicit Phase-2 backward at the packed boundary (see block comment).
 
-    position_mode="none" ONLY: this backward recomputes the scores from
-    Q/K without any rotation or positional bias, so it is wrong for the
-    forward's "rope"/"relative" modes -- use autograd through the forward
-    for those; passing another mode raises NotImplementedError.
-    TODO(kernel): RoPE backward = the inverse (orthogonal) rotation on
-    dQ/dK; relative backward = accumulate dS per (row, bin distance) into
-    rel_logits bins, then matmul back to relative_states/relative_proj.
+    position_mode="none" (default): recomputes the scores from Q/K with no
+    rotation or positional bias; rope_cos/rope_sin must be None.
+
+    position_mode="rope": recomputes the scores in ROTATED space, exactly
+    as the forward -- Q rows rotated at their token positions, K entries
+    rotated at their summary positions (j+1)*2^l - 1, V untouched -- then
+    applies the inverse (orthogonal) rotation to the accumulated dQ/dK
+    before writing them out: dX = R(p)^T dX_rot. Deferring the inverse to
+    the accumulated tile is exact because every contribution to a row
+    (resp. a K entry) shares the same rotation, so R^T distributes over
+    the sum. Requires rope_cos/rope_sin (same tables as the forward). The
+    saved `lse` is reused unchanged: it is the LSE of the rotated scores,
+    which is what the rotated-space P reconstruction needs. Inverse RoPE
+    is the mathematical VJP of the rotation; this backward accumulates in
+    FP32 and casts once at its output boundary, so for non-FP32 inputs
+    tiny rounding differences vs. autograd (which casts per apply_rope
+    call) are possible.
+
+    position_mode="relative": recomputes the biased scores exactly as the
+    forward -- X = QK*scale + b before softcap, b gathered per (row, bin
+    distance) from rel_logits = relative_states.float() @
+    relative_proj.float() -- in BOTH passes (P depends on the bias), and
+    accumulates the positional gradient in Pass A only (the Q-owned
+    traversal visits every valid (q, k) pair exactly once, and rel_logits
+    is Q-indexed). Since X is affine in b, db = dX (post-softcap-chain,
+    NOT dS): each tile's dX is scatter-added into its rows' bins,
+    producing the returned dposition = drel_logits. Requires
+    relative_states [B, N, Hq, d_rel] and relative_proj
+    [d_rel, max_relative_bins], the forward's exact arguments.
 
     Contracts
     ---------
@@ -1208,12 +1299,19 @@ def multilevel_attention_backward(
                  wrt the RETURNED lse, e.g. from a downstream attention sink
                  (see attention_sink_backward). Since dLSE/dS_i = P_i it
                  folds into Delta once: dS = P(dP - (Delta - dlse)). None
-                 reproduces the pre-sink contract bitwise.
+                 reproduces the pre-sink contract bitwise. Orthogonal to
+                 the positional modes.
 
         dq        [B, N, Hq, Dk]     (q.dtype)
         dk_packed [B, sumN, Hkv, Dk] (packed.k.dtype)
         dv_packed [B, sumN, Hkv, Dv] (packed.v.dtype)
+        dposition None                            ("none"/"rope")
+                  drel_logits [B, N, Hq, max_relative_bins] float32
+                                                  ("relative")
         stats     diagnostic dict (never asserted on)
+
+    The return arity is FIXED at five fields for every mode; dposition is
+    simply None when the mode has no positional parameters.
 
     Non-differentiable by construction (@torch.no_grad): it reads graph-
     attached packed.k/v VALUES without building a higher-order graph, so a
@@ -1223,10 +1321,25 @@ def multilevel_attention_backward(
         dq_tree, dk, dv = torch.autograd.grad(
             (packed.k, packed.v), (q, k, v), (dk_packed, dv_packed))
         dq_total = dq + dq_tree
+
+    Likewise drel_logits is the VJP seed at the rel_logits boundary;
+    either compose in closed form,
+
+        drel_states = einsum("bnhr,dr->bnhd", drel_logits, proj.float())
+        drel_proj   = einsum("bnhd,bnhr->dr", states.float(), drel_logits)
+
+    or recompute a graph-attached rel_logits and
+    torch.autograd.grad(rel_logits, (states, proj), drel_logits).
+
+    TODO(kernel): the reference materializes drel_logits to make the
+    contract verifiable; [B, N, Hq, max_relative_bins] gets large at long
+    context, so the kernel may instead fold tile-local dX directly into
+    drelative_states and a reduced drelative_proj.
     """
-    if position_mode != "none":
-        raise NotImplementedError(
-            "explicit backward currently supports position_mode='none' only"
+    if position_mode not in ("none", "rope", "relative"):
+        raise ValueError(
+            f"position_mode must be 'none', 'rope' or 'relative', got "
+            f"{position_mode!r}"
         )
     B, N, Hq, Dk = q.shape
     Hkv = packed.k.shape[2]
@@ -1244,6 +1357,74 @@ def multilevel_attention_backward(
     spec = RangeSpec.from_fmap(fmap, cache_size, N)
     if tuple(packed.level_offsets) != spec.level_offsets():
         raise ValueError("packed level_offsets do not match the schedule")
+
+    # Positional-argument validation mirrors multilevel_attention_forward's.
+    rel_logits = None
+    max_relative_bins = 0
+    if position_mode == "none":
+        if any(t is not None for t in (rope_cos, rope_sin,
+                                       relative_states, relative_proj)):
+            raise ValueError(
+                "positional arguments provided with position_mode='none'"
+            )
+    elif position_mode == "rope":
+        if rope_cos is None or rope_sin is None:
+            raise ValueError(
+                "position_mode='rope' requires rope_cos and rope_sin"
+            )
+        if relative_states is not None or relative_proj is not None:
+            raise ValueError(
+                "relative_* arguments provided with position_mode='rope'"
+            )
+        if Dk % 2 != 0:
+            raise ValueError(f"RoPE requires an even Dk, got {Dk}")
+        if rope_cos.shape != rope_sin.shape:
+            raise ValueError(
+                f"rope_cos shape {tuple(rope_cos.shape)} != rope_sin "
+                f"shape {tuple(rope_sin.shape)}"
+            )
+        if rope_cos.dim() != 2 or rope_cos.shape[-1] * 2 != Dk:
+            raise ValueError(
+                f"rope tables must be [n_pos, {Dk // 2}], got "
+                f"{tuple(rope_cos.shape)}"
+            )
+        if rope_cos.shape[0] < N:
+            raise ValueError(
+                f"rope tables cover {rope_cos.shape[0]} positions; "
+                f"summary positions reach N-1={N - 1}"
+            )
+        validate_summary_causality(spec)
+    else:  # "relative"
+        if relative_states is None or relative_proj is None:
+            raise ValueError(
+                "position_mode='relative' requires relative_states and "
+                "relative_proj"
+            )
+        if rope_cos is not None or rope_sin is not None:
+            raise ValueError(
+                "rope_* arguments provided with position_mode='relative'"
+            )
+        if (relative_states.dim() != 4
+                or tuple(relative_states.shape[:3]) != (B, N, Hq)):
+            raise ValueError(
+                f"relative_states shape {tuple(relative_states.shape)} != "
+                f"[{B}, {N}, {Hq}, d_rel]"
+            )
+        if (relative_proj.dim() != 2
+                or relative_proj.shape[0] != relative_states.shape[-1]):
+            raise ValueError(
+                f"relative_proj shape {tuple(relative_proj.shape)} "
+                f"incompatible with d_rel={relative_states.shape[-1]}"
+            )
+        max_relative_bins = relative_proj.shape[1]
+        if max_relative_bins < 1:
+            raise ValueError("relative_proj must have >= 1 bins")
+        validate_summary_causality(spec)
+        # The forward's exact rel_logits, recomputed once.
+        rel_logits = torch.einsum(
+            "bnhd,dr->bnhr",
+            relative_states.float(), relative_proj.float(),
+        )  # [B, N, Hq, max_relative_bins]
 
     scale = 1.0 / math.sqrt(Dk)
     device = q.device
@@ -1263,6 +1444,11 @@ def multilevel_attention_backward(
     dq_acc = torch.zeros(B, N, Hq, Dk, device=device, dtype=torch.float32)
     dk_acc = torch.zeros_like(packed.k, dtype=torch.float32)
     dv_acc = torch.zeros_like(packed.v, dtype=torch.float32)
+    drel_acc = None
+    if position_mode == "relative":
+        drel_acc = torch.zeros(
+            B, N, Hq, max_relative_bins, device=device, dtype=torch.float32
+        )
 
     stats = {
         "kv_tiles": 0,
@@ -1276,6 +1462,23 @@ def multilevel_attention_backward(
         rows = [range_bounds(spec, qi, level) for qi in range(q0, q1)]
         lo = torch.tensor([r[0] for r in rows], device=device, dtype=torch.long)
         hi = torch.tensor([r[1] for r in rows], device=device, dtype=torch.long)
+        return lo, hi
+
+    def row_bounds_all(q0, q1):
+        # All-levels [Mq, num_levels] view; the relative mode needs the
+        # cross-level matrices for bin ranks (same values as the forward's).
+        rows = [
+            [range_bounds(spec, qi, lv) for lv in range(spec.num_levels)]
+            for qi in range(q0, q1)
+        ]
+        lo = torch.tensor(
+            [[a for a, _ in row] for row in rows],
+            device=device, dtype=torch.long,
+        )
+        hi = torch.tensor(
+            [[c for _, c in row] for row in rows],
+            device=device, dtype=torch.long,
+        )
         return lo, hi
 
     # ------------------------------------------------------------------
@@ -1293,11 +1496,28 @@ def multilevel_attention_backward(
                 delta_t = delta[b, q_start:q_end, hq_slice]
                 dQ_tile = torch.zeros(M, E, Dk, device=device, dtype=torch.float32)
 
+                if position_mode == "rope":
+                    q_pos = torch.arange(
+                        q_start, q_end, device=device
+                    )[:, None]
+                    Q = apply_rope(Q, q_pos, rope_cos, rope_sin)
+                elif position_mode == "relative":
+                    row_lo_all, row_hi_all = row_bounds_all(q_start, q_end)
+                    rel_t = rel_logits[b, q_start:q_end, hq_slice]
+                    drel_t = torch.zeros(
+                        M, E, max_relative_bins,
+                        device=device, dtype=torch.float32,
+                    )
+
                 for level in range(spec.num_levels):
                     tile_k_lo, tile_k_hi = fwd_bounds(spec, q_start, q_end, level)
                     if tile_k_lo == tile_k_hi:
                         continue
-                    row_lo, row_hi = row_bounds(q_start, q_end, level)
+                    if position_mode == "relative":
+                        row_lo = row_lo_all[:, level]
+                        row_hi = row_hi_all[:, level]
+                    else:
+                        row_lo, row_hi = row_bounds(q_start, q_end, level)
                     for k_start in range(tile_k_lo, tile_k_hi, block_n):
                         k_end = min(k_start + block_n, tile_k_hi)
                         K, V = _kv_tile(packed, b, hkv, level, k_start, k_end)
@@ -1305,12 +1525,46 @@ def multilevel_attention_backward(
                         valid = (kv_idx[None, :] >= row_lo[:, None]) & (
                             kv_idx[None, :] < row_hi[:, None]
                         )
-                        dQ_t, _, _ = _tile_grads(
+                        bias = None
+                        idx3 = None
+                        if position_mode == "rope":
+                            k_pos = (kv_idx + 1) * (1 << level) - 1
+                            K = apply_rope(K, k_pos, rope_cos, rope_sin)
+                        elif position_mode == "relative":
+                            # The forward's exact bias reconstruction.
+                            dist = _tile_bin_distances(
+                                spec, row_lo_all, row_hi_all, kv_idx, level,
+                                max_relative_bins, valid, q_start, q_end,
+                            )
+                            idx = torch.where(
+                                valid, dist, torch.zeros_like(dist)
+                            )
+                            idx3 = idx[:, None, :].expand(M, E, -1)
+                            bias = torch.gather(rel_t, 2, idx3)
+                        dQ_t, _, _, dB = _tile_grads(
                             Q, K, V, dO, lse_t, delta_t, valid, scale, softcap,
                             need_dq=True, need_dkv=False,
+                            bias=bias,
+                            need_dbias=position_mode == "relative",
                         )
                         dQ_tile += dQ_t
+                        if position_mode == "relative":
+                            # db = dX (bias enters X before softcap); dX is
+                            # zero off-mask, so clamped invalid lanes add
+                            # exact zeros to bin 0.
+                            drel_t.scatter_add_(2, idx3, dB)
 
+                if position_mode == "rope":
+                    # dQ accumulated in rotated space; one inverse rotation
+                    # per row (all contributions share R(p_q)).
+                    dQ_tile = apply_rope(
+                        dQ_tile, q_pos, rope_cos, rope_sin, inverse=True
+                    )
+                elif position_mode == "relative":
+                    # Pass A is the sole owner of the positional gradient:
+                    # the Q-owned traversal visits every valid (q, k) pair
+                    # exactly once (Pass B would double-count).
+                    drel_acc[b, q_start:q_end, hq_slice] = drel_t
                 dq_acc[b, q_start:q_end, hq_slice] = dQ_tile
 
     # ------------------------------------------------------------------
@@ -1337,11 +1591,20 @@ def multilevel_attention_backward(
                     dK_tile = torch.zeros(Kt, Dk, device=device, dtype=torch.float32)
                     dV_tile = torch.zeros(Kt, Dv, device=device, dtype=torch.float32)
 
+                    if position_mode == "rope":
+                        k_pos = (kv_idx + 1) * (1 << level) - 1
+                        K = apply_rope(K, k_pos, rope_cos, rope_sin)
+
                     # Aligned BLOCK_M Q tiles intersecting the hull.
                     for q0 in range((q_lo // block_m) * block_m, q_hi, block_m):
                         q1 = min(q0 + block_m, N)
                         stats["q_tiles_enumerated"] += 1
-                        row_lo, row_hi = row_bounds(q0, q1, level)
+                        if position_mode == "relative":
+                            row_lo_all, row_hi_all = row_bounds_all(q0, q1)
+                            row_lo = row_lo_all[:, level]
+                            row_hi = row_hi_all[:, level]
+                        else:
+                            row_lo, row_hi = row_bounds(q0, q1, level)
                         valid = (kv_idx[None, :] >= row_lo[:, None]) & (
                             kv_idx[None, :] < row_hi[:, None]
                         )
@@ -1352,12 +1615,41 @@ def multilevel_attention_backward(
                         dO = dout[b, q0:q1, hq_slice]
                         lse_t = lse[b, q0:q1, hq_slice]
                         delta_t = delta[b, q0:q1, hq_slice]
-                        _, dK_t, dV_t = _tile_grads(
+                        bias = None
+                        if position_mode == "rope":
+                            q_pos = torch.arange(
+                                q0, q1, device=device
+                            )[:, None]
+                            Q = apply_rope(Q, q_pos, rope_cos, rope_sin)
+                        elif position_mode == "relative":
+                            # P depends on the bias, so Pass B must
+                            # reconstruct it too; it accumulates no
+                            # positional gradient (Pass A owns that).
+                            dist = _tile_bin_distances(
+                                spec, row_lo_all, row_hi_all, kv_idx, level,
+                                max_relative_bins, valid, q0, q1,
+                            )
+                            idx = torch.where(
+                                valid, dist, torch.zeros_like(dist)
+                            )
+                            bias = torch.gather(
+                                rel_logits[b, q0:q1, hq_slice], 2,
+                                idx[:, None, :].expand(q1 - q0, E, -1),
+                            )
+                        _, dK_t, dV_t, _ = _tile_grads(
                             Q, K, V, dO, lse_t, delta_t, valid, scale, softcap,
-                            need_dq=False, need_dkv=True,
+                            need_dq=False, need_dkv=True, bias=bias,
                         )
                         dK_tile += dK_t
                         dV_tile += dV_t
+
+                    if position_mode == "rope":
+                        # dK accumulated in rotated space; one inverse
+                        # rotation per entry (all contributions share its
+                        # summary-position rotation). dV: V never rotated.
+                        dK_tile = apply_rope(
+                            dK_tile, k_pos, rope_cos, rope_sin, inverse=True
+                        )
 
                     # Storage addressing: offset[level] + local, checked once.
                     p_start, p_end = _packed_slice(packed, level, k_start, k_end)
@@ -1368,5 +1660,6 @@ def multilevel_attention_backward(
         dq_acc.to(q.dtype),
         dk_acc.to(packed.k.dtype),
         dv_acc.to(packed.v.dtype),
+        drel_acc,  # None unless position_mode == "relative"
         stats,
     )

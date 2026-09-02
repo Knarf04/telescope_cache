@@ -347,11 +347,12 @@ def part2_phase2(tag, q, packed, fmap, cache_size, block_m, block_n, softcap,
     dout = seeded_randn_like(out, dout_seed)
     dq_ref, dk_ref, dv_ref = torch.autograd.grad(out, (q_leaf, k_leaf, v_leaf), dout)
 
-    dq, dk_p, dv_p, stats = multilevel_attention_backward(
+    dq, dk_p, dv_p, dposition, stats = multilevel_attention_backward(
         q_leaf.detach(),
         PackedKV(k_leaf.detach(), v_leaf.detach(), packed.level_offsets),
         out.detach(), lse.detach(), dout, fmap, cache_size,
         block_m=block_m, block_n=block_n, softcap=softcap)
+    assert dposition is None  # fixed 5-field contract; None outside relative
 
     check_tensor("dq", dq, q.shape, q.dtype)
     check_tensor("dk_packed", dk_p, packed.k.shape, packed.k.dtype)
@@ -398,9 +399,10 @@ def part3_composition(q, k, v, L, fmap, cache_size, block_m, block_n, dout,
     with torch.no_grad():
         out, lse = multilevel_attention_forward(
             q_l, packed_g, fmap, cache_size, block_m=block_m, block_n=block_n)
-    dq_attn, dk_p, dv_p, _ = multilevel_attention_backward(
+    dq_attn, dk_p, dv_p, dposition, _ = multilevel_attention_backward(
         q_l, packed_g, out, lse, dout, fmap, cache_size,
         block_m=block_m, block_n=block_n)
+    assert dposition is None
     # Tree-VJP leaf set per mode: k/v (and conv weights, when enabled) always
     # feed the tree; q only in QK weight mode (in linear mode the tree never
     # touches q -- allow_unused=False would raise -- and dq_tree is zero).

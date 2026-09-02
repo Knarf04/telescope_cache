@@ -315,9 +315,10 @@ def test_explicit_backward_with_sink(device):
             q_l, packed_g, fmap, cache_size, block_m=3, block_n=2)
     dout_pre, dlse, dsinks = attention_sink_backward(
         out, lse, sinks0, dout_post)
-    dq_attn, dk_p, dv_p, _ = multilevel_attention_backward(
+    dq_attn, dk_p, dv_p, dposition, _ = multilevel_attention_backward(
         q_l, packed_g, out, lse, dout_pre, fmap, cache_size,
         block_m=3, block_n=2, dlse=dlse)
+    assert dposition is None  # fixed 5-field contract; None outside relative
     dq_tree, dk_tree, dv_tree = torch.autograd.grad(
         (packed_g.k, packed_g.v), (q_l, k_l, v_l), (dk_p, dv_p),
         retain_graph=True)  # the negative control reuses this tree graph
@@ -330,7 +331,7 @@ def test_explicit_backward_with_sink(device):
 
     # Negative control: dropping the dlse seed (LSE path) must NOT match --
     # proves the dlse term is load-bearing, not noise.
-    dq_bad, dk_pb, dv_pb, _ = multilevel_attention_backward(
+    dq_bad, dk_pb, dv_pb, _, _ = multilevel_attention_backward(
         q_l, packed_g, out, lse, dout_pre, fmap, cache_size,
         block_m=3, block_n=2)
     dq_tb, _, _ = torch.autograd.grad(
