@@ -236,6 +236,67 @@ class LayerNormParameterized(nn.Module):
             x = x + self.bias
         return x
 
+
+class ShortConv1d(nn.Module):
+    """
+    Depthwise causal short convolution with a mandatory residual over
+    [B, N, C]:  out = x + causal_depthwise_conv(x).
+
+    Per channel c:  y[t, c] = sum_j weight[c, j] * x[t-K+1+j, c] -- only the
+    current and past tokens contribute; no mixing across channels (groups=C),
+    no bias, no activation. The input is cast to FP32, convolved, the
+    residual is ADDED IN FP32, and only the final sum is cast back to the
+    input dtype (same contract as telescope_cache.reference.short_conv, the
+    independent oracle; equivalence is enforced by test/test_shortconv.py,
+    not by shared code).
+
+    TODO(decode): incremental decoding requires a rolling state of
+    pre-convolution projected K/V values. Current implementation supports
+    full-sequence training/prefill only. Missing pieces: persistent
+    per-layer conv state (last K-1 pre-conv K/V rows), a one-token update
+    path, prefill->decode state initialization, state reset/reorder on
+    cache reset/beam reorder, interaction with the existing KV cache, and
+    prefill-vs-incremental-decode equivalence tests.
+    NOTE: the attention KV cache holds POST-conv K/V; the conv state is
+    PRE-conv K/V. They are different objects -- do not conflate them.
+
+    TODO(padding/packing): current implementation assumes one continuous
+    causal sequence per batch row. It does not reset convolution state
+    across padding or packed-example boundaries (would need seq_idx/segment
+    boundaries).
+    """
+
+    def __init__(self, channels: int, kernel_size: int):
+        super().__init__()
+        if kernel_size <= 0:
+            raise ValueError(
+                f"kernel_size must be positive, got {kernel_size}"
+            )
+        self.channels = channels
+        self.kernel_size = kernel_size
+        # Zero initialization is intentional so enabling short-conv starts
+        # exactly from the original attention model (the residual makes
+        # W=0 an identity). Design choice for finetuning an existing stack,
+        # not part of the Conv1D definition.
+        self.weight = nn.Parameter(torch.zeros(channels, kernel_size))
+
+    def reset_parameters(self):
+        self.weight.data.zero_()
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # x: [B, N, C]
+        B, N, C = x.shape
+        input_dtype = x.dtype
+        x_fp32 = x.float()
+        y = nn.functional.conv1d(
+            x_fp32.transpose(1, 2),
+            self.weight.float().unsqueeze(1),
+            padding=self.kernel_size - 1,
+            groups=C,
+        )[:, :, :N].transpose(1, 2)
+        return (x_fp32 + y).to(input_dtype)
+
+
 class PositionEncoder:
     """
     Provides the ability to insert position-encoding logic into MHA.

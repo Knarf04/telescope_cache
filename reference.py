@@ -16,6 +16,7 @@ Pipeline
     q, k, v
       -> compute_summary_weights          w = LSE_h(q_h.k / sqrt(Dk))   [Phase 1]
          (or compute_linear_weights       w = x.w_proj^T, trained mode)
+      -> short_conv (optional)            causal depthwise conv + residual on K/V
       -> build_dyadic_summaries           canonical dyadic K/V tree
       -> pack_levels                      one level-major buffer per tensor
       -> multilevel_attention_forward     (out, lse)                    [Phase 2]
@@ -49,6 +50,7 @@ __all__ = [
     "PackedKV",
     "compute_summary_weights",
     "compute_linear_weights",
+    "short_conv",
     "build_dyadic_summaries",
     "pack_levels",
     "multilevel_attention_forward",
@@ -110,6 +112,53 @@ def compute_linear_weights(
     return x.matmul(w_proj.t()).unsqueeze(-1)
 
 
+def short_conv(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+    """
+    Causal depthwise short convolution with a mandatory residual.
+
+    x: [B, N, C]   weight: [C, K]   ->   [B, N, C]
+
+        y[b, t, c] = x[b, t, c] + sum_j weight[c, j] * x[b, t-K+1+j, c]
+
+    Only current and past tokens contribute (left zero-padding); depthwise
+    (groups = C, no mixing across channels), no bias, no activation. The
+    input is cast to FP32, convolved, the residual is ADDED IN FP32, and
+    only the final sum is cast back to x.dtype -- this ordering is part of
+    the contract (see test_shortconv.test_fp32_add_ordering), not
+    x + conv(x).to(dtype).
+
+    TODO(decode): incremental decoding requires a rolling state of
+    pre-convolution projected K/V values. Current implementation supports
+    full-sequence training/prefill only.
+
+    TODO(padding/packing): current implementation assumes one continuous
+    causal sequence per batch row. It does not reset convolution state
+    across padding or packed-example boundaries (would need seq_idx/segment
+    boundaries).
+    """
+    B, N, C = x.shape
+    if weight.dim() != 2 or weight.shape[0] != C:
+        raise ValueError(
+            f"conv weight shape {tuple(weight.shape)} incompatible with "
+            f"C={C}; expected [C, K]"
+        )
+    K = weight.shape[1]
+    if K <= 0:
+        raise ValueError(f"conv kernel size must be positive, got {K}")
+
+    input_dtype = x.dtype
+    x_fp32 = x.float()
+    # conv1d is cross-correlation; padding=K-1 plus the [:N] crop yields
+    # exactly the causal sum above (no kernel flip).
+    y = torch.nn.functional.conv1d(
+        x_fp32.transpose(1, 2),
+        weight.float().unsqueeze(1),
+        padding=K - 1,
+        groups=C,
+    )[:, :, :N].transpose(1, 2)
+    return (x_fp32 + y).to(input_dtype)
+
+
 def build_dyadic_summaries(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -118,6 +167,8 @@ def build_dyadic_summaries(
     detach_weights: bool = False,
     x: Optional[torch.Tensor] = None,
     w_proj: Optional[torch.Tensor] = None,
+    k_conv_weight: Optional[torch.Tensor] = None,
+    v_conv_weight: Optional[torch.Tensor] = None,
 ):
     """
     Build a canonical dyadic K/V summary tree directly.
@@ -143,7 +194,30 @@ def build_dyadic_summaries(
     detach_weights: gradient-only switch (forward values unchanged) that cuts
     the w -> merge-weight gradient branch (q/k in QK mode, x/w_proj in linear
     mode); used by test_backward.py.
+
+    Short-conv mode: with k_conv_weight [Hkv*Dk, K] and v_conv_weight
+    [Hkv*Dv, K] both given, short_conv is applied to k and v (flattened over
+    heads, channel c = h*D + d, matching fms/train.py's flat post-projection
+    layout) BEFORE the merge weights are computed and before the tree is
+    built. Both-or-neither; providing exactly one raises. With both None this
+    function is bitwise-identical to the pre-conv behavior. See the
+    TODO(decode)/TODO(padding/packing) notes on short_conv.
     """
+    if (k_conv_weight is None) != (v_conv_weight is None):
+        raise ValueError(
+            "k_conv_weight and v_conv_weight must both be provided or both "
+            "be None"
+        )
+    if k_conv_weight is not None:
+        B, N, Hkv, Dk = k.shape
+        Dv = v.shape[-1]
+        k = short_conv(
+            k.reshape(B, N, Hkv * Dk), k_conv_weight
+        ).reshape(B, N, Hkv, Dk)
+        v = short_conv(
+            v.reshape(B, N, Hkv * Dv), v_conv_weight
+        ).reshape(B, N, Hkv, Dv)
+
     if (x is None) != (w_proj is None):
         raise ValueError(
             "x and w_proj must both be provided (linear weight mode) or "

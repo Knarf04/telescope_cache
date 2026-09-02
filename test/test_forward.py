@@ -25,6 +25,7 @@ from telescope_cache.reference import (  # noqa: E402
     compute_summary_weights,
     multilevel_attention_forward,
     pack_levels,
+    short_conv,
 )
 
 
@@ -129,6 +130,8 @@ def build_plan_based_summaries(
     detach_weights: bool = False,
     x: Optional[torch.Tensor] = None,
     w_proj: Optional[torch.Tensor] = None,
+    k_conv_weight: Optional[torch.Tensor] = None,
+    v_conv_weight: Optional[torch.Tensor] = None,
 ):
     """
     Exact level-major analogue of the original weighted scan().
@@ -142,9 +145,27 @@ def build_plan_based_summaries(
 
     x/w_proj: same weight-mode switch as build_dyadic_summaries (must use the
     same reference functions so both paths get bitwise-identical w).
+
+    k_conv_weight/v_conv_weight: same short-conv switch as
+    build_dyadic_summaries (same reference short_conv so both tree builders
+    get bitwise-identical conv'd K/V).
     """
     B, N, _, _ = q.shape
     Hkv = k.shape[2]
+
+    if (k_conv_weight is None) != (v_conv_weight is None):
+        raise ValueError(
+            "k_conv_weight and v_conv_weight must both be provided or both "
+            "be None"
+        )
+    if k_conv_weight is not None:
+        Dk, Dv = k.shape[-1], v.shape[-1]
+        k = short_conv(
+            k.reshape(B, N, Hkv * Dk), k_conv_weight
+        ).reshape(B, N, Hkv, Dk)
+        v = short_conv(
+            v.reshape(B, N, Hkv * Dv), v_conv_weight
+        ).reshape(B, N, Hkv, Dv)
 
     if (x is None) != (w_proj is None):
         raise ValueError(
@@ -1281,6 +1302,7 @@ def run_case(
     B, N, Hq, Hkv, Dk, Dv, cache_size, fmap, block_m, block_n,
     expect, device, golden_ranges=None, seed=0,
     dtype=torch.float32, weight_mode="qk",
+    use_sconv=False, sconv_kernel=4,
 ):
     print(
         f"\n=== {name}: B={B} N={N} Hq={Hq} Hkv={Hkv} Dk={Dk} Dv={Dv} "
@@ -1310,6 +1332,20 @@ def run_case(
             Hkv, emb_dim, device=device, dtype=dtype
         ) / emb_dim ** 0.5
 
+    # Short-conv weights. Drawn AFTER x/w_proj so pre-existing cases see the
+    # same random streams (test_backward.py mirrors this order). 1/sqrt(K)
+    # keeps the conv'd K/V ~O(1) so QK logits and the pair softmax stay
+    # unsaturated at the suite's tolerances. ShortConv1d zero-inits (exact
+    # identity), so tests always use explicit random weights.
+    k_conv_weight = v_conv_weight = None
+    if use_sconv:
+        k_conv_weight = torch.randn(
+            Hkv * Dk, sconv_kernel, device=device, dtype=dtype
+        ) / sconv_kernel ** 0.5
+        v_conv_weight = torch.randn(
+            Hkv * Dv, sconv_kernel, device=device, dtype=dtype
+        ) / sconv_kernel ** 0.5
+
     # --------------------------------------------------------
     # Original selection/merge plan and level-major reference summaries.
     # --------------------------------------------------------
@@ -1317,7 +1353,10 @@ def run_case(
         N, fmap, cache_size, device
     )
     old_k_levels, old_v_levels, _, old_valid_levels = (
-        build_plan_based_summaries(q, k, v, merge_plan, x=x, w_proj=w_proj)
+        build_plan_based_summaries(
+            q, k, v, merge_plan, x=x, w_proj=w_proj,
+            k_conv_weight=k_conv_weight, v_conv_weight=v_conv_weight,
+        )
     )
 
     # --------------------------------------------------------
@@ -1326,7 +1365,8 @@ def run_case(
     # --------------------------------------------------------
     num_summary_levels = len(merge_plan) - 2
     dyadic_k_levels, dyadic_v_levels, _ = build_dyadic_summaries(
-        q, k, v, num_summary_levels, x=x, w_proj=w_proj
+        q, k, v, num_summary_levels, x=x, w_proj=w_proj,
+        k_conv_weight=k_conv_weight, v_conv_weight=v_conv_weight,
     )
     dyadic_select_level, dyadic_select_index, old_to_dyadic = (
         remap_plan_to_dyadic(merge_plan, select_level, select_index, N)
@@ -1581,7 +1621,21 @@ for _base in ("baseline", "readme_tiny"):
     _c["name"] = _base + "_linear"
     _c["weight_mode"] = "linear"
     CASES.append(_c)
-del _base, _c
+
+# Short-conv variants: identical geometry (expect/golden_ranges are value-
+# independent); only the K/V entering Phase 1 differ. readme_tiny_sconv uses
+# a non-default kernel; the combined case proves the conv and linear
+# weight-mode flags are orthogonal.
+for _base, _ks in (("baseline", 4), ("readme_tiny", 3)):
+    _c = copy.deepcopy(next(c for c in CASES if c["name"] == _base))
+    _c["name"] = _base + "_sconv"
+    _c["use_sconv"], _c["sconv_kernel"] = True, _ks
+    CASES.append(_c)
+_c = copy.deepcopy(next(c for c in CASES if c["name"] == "readme_tiny_sconv"))
+_c["name"] = "readme_tiny_sconv_linear"
+_c["weight_mode"] = "linear"
+CASES.append(_c)
+del _base, _ks, _c
 
 
 def main(argv=None):

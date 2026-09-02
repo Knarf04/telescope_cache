@@ -175,6 +175,23 @@ class MultiHeadAttention(nn.Module):
         if self.weight_mode == "linear":
             self.w = nn.Linear(self.emb_dim, self.kvheads, bias=False)
 
+        # Optional short causal depthwise conv (+residual) on projected K/V,
+        # applied to the flat post-in_proj states before head split / RoPE /
+        # weighting. Training/prefill only; see the TODO(decode) block on
+        # ShortConv1d in fms_template.py. fms/inference.py has no conv
+        # support yet: a model trained with this flag mismatches at
+        # inference until inference grows the same mode and a rolling
+        # pre-conv state (same caveat pattern as weight_mode="linear").
+        self.use_kv_short_conv = False
+        self.kv_conv_kernel_size = 4
+        if self.use_kv_short_conv:
+            self.k_sconv = ShortConv1d(
+                self.kvheads * self.emb_kq_per_head, self.kv_conv_kernel_size
+            )
+            self.v_sconv = ShortConv1d(
+                self.kvheads * self.emb_v_per_head, self.kv_conv_kernel_size
+            )
+
         self.mask = None
 
     def reset_parameters(self):
@@ -183,7 +200,7 @@ class MultiHeadAttention(nn.Module):
                 nn.init.trunc_normal_(m.weight, mean=0.0, std=0.02)
                 if self.use_bias:
                     m.bias.data.zero_()
-            elif isinstance(m, LayerNormParameterized) or isinstance(m, QKV):
+            elif isinstance(m, (LayerNormParameterized, QKV, ShortConv1d)):
                 m.reset_parameters()
 
     # def to_tp(self, group: ProcessGroup) -> "TPMultiHeadAttention":
@@ -290,6 +307,18 @@ class MultiHeadAttention(nn.Module):
         # todo: Cross attention (This always is true for now)
         if is_self or past_key_value_state is None:
             q_out, k_out, v_out = self.in_proj(q, k, v)
+
+            if self.use_kv_short_conv:
+                # k_out/v_out are flat [b, l, kvheads*head_dim]; the
+                # depthwise conv commutes with the head reshape below
+                # (channel c = h*D + d).
+                # TODO(decode): full-sequence only -- see ShortConv1d.
+                # TODO(padding/packing): assumes one continuous causal
+                # sequence per batch row; conv state is not reset across
+                # padding or packed-example boundaries (`mask` only gates
+                # attention, it does not zero K/V rows).
+                k_out = self.k_sconv(k_out)
+                v_out = self.v_sconv(v_out)
 
             # note: transposes will be moved in a later PR to fix dis-contiguous tensor issues
             queries = q_out.view(batch_size, q_len, self.nheads, self.emb_kq_per_head)
