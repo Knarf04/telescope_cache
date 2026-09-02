@@ -9,6 +9,45 @@ TODOs:
 - [x] Implement sink token & gated attention ([hf pr](https://github.com/huggingface/transformers/pull/47179)) — `reference.apply_attention_sink`/`apply_output_gate`, `use_sinks`/`use_gate` in `fms/train.py`
 - [x] Think about proper RoPE implementation for aggregated caches — post-summary RoPE (`position_mode="rope"`): a summary is a virtual token at its interval's right endpoint, rotated after aggregation (deliberately NOT the merge of individually-rotated keys); see `multilevel_attention_forward`'s positional-encoding contract and `test/test_position.py`
 
+## Pipeline
+
+```text
+raw q, k, v                    hidden states x (original, pre-projection;
+     │                          consumed by: linear merge weights,
+     ▼                          relative_states, and the output gate)
+short causal conv + residual on K/V     (optional; separate K/V weights,
+     │                                   before all other K processing)
+     ▼
+merge weights w:  logsumexp(Q·K_conv/√Dk)  — or —  x @ w_proj^T (trained)
+     │
+     ▼
+build dyadic summaries                  (softmax(w)-weighted pair merges;
+     │                                   position-independent in every mode)
+     ▼
+pack levels   [ L0 | L1 | … | LL ]
+     │
+     ▼
+Phase-2 multilevel attention, per KV tile:
+     rotate Q and summarized K first in "rope" mode   (post-summary RoPE,
+                                  right-endpoint virtual-token positions)
+     scores = Q·K/√Dk
+     + learned bin-relative bias in "relative" mode   (raw logit, from
+                                  relative_states; "none" skips both)
+     → softcap tanh → range mask → online softmax
+     │
+     ▼
+ (out, lse)
+     │
+     ▼
+attention sink   out · σ(lse − s_h)     (optional; consumes BOTH out and lse
+     │                                   — see the dlse backward contract)
+     ▼
+SiLU output gate  SiLU(x·W_g^T) ⊙ out   (optional; gate from the original
+     │                                   query-side x)
+     ▼
+output projection (`dense` in fms/train.py)
+```
+
 ## File roles
 
 | File | Role |
