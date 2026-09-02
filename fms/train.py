@@ -192,6 +192,28 @@ class MultiHeadAttention(nn.Module):
                 self.kvheads * self.emb_v_per_head, self.kv_conv_kernel_size
             )
 
+        # Learned attention sink (one logit per QUERY head joining the
+        # softmax denominator with an implicit zero value; no sink K/V
+        # token, nothing enters the cache) and SiLU output gate
+        # (SiLU(gate_proj(q)) * attn before self.dense). Independent flags;
+        # both off -> bitwise-original path. fms/inference.py has neither
+        # mode yet (same mismatch caveat as weight_mode="linear").
+        # TODO(tp): shard `sinks` and gate_proj rows by the query-head
+        # partition if tensor parallelism is added.
+        self.use_sinks = False
+        self.use_gate = False
+        if self.use_sinks:
+            # Zero-init required. NOTE: a zero sink is NOT an identity (it
+            # adds e^0 = 1 to the denominator); only use_sinks=False
+            # reproduces the original model.
+            self.sinks = nn.Parameter(torch.zeros(self.nheads))
+        if self.use_gate:
+            # Auto-initialized by reset_parameters (trunc_normal). Do NOT
+            # zero-init: SiLU(0) = 0 would zero the attention output.
+            self.gate_proj = nn.Linear(
+                self.emb_dim, self.nheads * self.emb_v_per_head, bias=False
+            )
+
         self.mask = None
 
     def reset_parameters(self):
@@ -202,6 +224,9 @@ class MultiHeadAttention(nn.Module):
                     m.bias.data.zero_()
             elif isinstance(m, (LayerNormParameterized, QKV, ShortConv1d)):
                 m.reset_parameters()
+        # Raw Parameter, not a module: the loop above never reaches it.
+        if getattr(self, "sinks", None) is not None:
+            self.sinks.data.zero_()
 
     # def to_tp(self, group: ProcessGroup) -> "TPMultiHeadAttention":
     #     return TPMultiHeadAttention.import_module(self, group)
@@ -381,9 +406,31 @@ class MultiHeadAttention(nn.Module):
         def soft_cap(score, b, h, q_i, kv_i):
             return 20 * score.div(20).tanh()
         attention = functools.partial(flex_attention, block_mask=block_mask, score_mod=soft_cap)
-        attn = attention(queries, keys_e, values_e)
+        if self.use_sinks:
+            # PyTorch FlexAttention backward supports gradients through the
+            # returned LSE (natural log, fp32), which the sink needs: the
+            # rescale backprops into the logits via lse.
+            # TODO(verify-remote): tiny numerical dq/dk/dv/dsinks check vs a
+            # dense augmented-softmax oracle for the exact installed
+            # torch/compiler version and backend (prototype API; some
+            # backends document dLSE as unsupported).
+            # TODO(kernel): fuse the sink into the online softmax and stop
+            # exposing lse (see reference.apply_attention_sink).
+            attn, lse = attention(queries, keys_e, values_e, return_lse=True)
+            sink_scale = torch.sigmoid(
+                lse.float() - self.sinks.float()[None, :, None]
+            )  # b h n
+            attn = attn * sink_scale.unsqueeze(-1).to(attn.dtype)
+        else:
+            attn = attention(queries, keys_e, values_e)
         attn = attn.transpose(1,2)  # b l h d
         attn = attn.reshape(batch_size, q_len, self.nheads * self.emb_v_per_head)
+        if self.use_gate:
+            # Gate from the ORIGINAL query-side pre-projection hidden state
+            # `q` (no RoPE, not projected Q), matching
+            # reference.apply_output_gate. SiLU, not sigmoid. No cache or
+            # decode state: recomputed from the current token's hidden state.
+            attn = nn.functional.silu(self.gate_proj(q)) * attn
         out = self.dense(attn)
 
         # if use_cache=True, we return the hidden_state as well as the kv cache

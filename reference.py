@@ -14,12 +14,14 @@ lives in the test files. Behavioral contracts are enforced by:
 Pipeline
 --------
     q, k, v
+      -> short_conv (optional)            causal depthwise conv + residual on K/V
       -> compute_summary_weights          w = LSE_h(q_h.k / sqrt(Dk))   [Phase 1]
          (or compute_linear_weights       w = x.w_proj^T, trained mode)
-      -> short_conv (optional)            causal depthwise conv + residual on K/V
       -> build_dyadic_summaries           canonical dyadic K/V tree
       -> pack_levels                      one level-major buffer per tensor
       -> multilevel_attention_forward     (out, lse)                    [Phase 2]
+      -> apply_attention_sink (optional)  out * sigmoid(lse - sinks)
+      -> apply_output_gate (optional)     SiLU(x.gate_w^T) * out
       -> multilevel_attention_backward    (dq, dk_packed, dv_packed)    [Phase 2]
 
 Phase-1 backward (gradients of packed K/V back to raw q, k, v, including the
@@ -54,6 +56,9 @@ __all__ = [
     "build_dyadic_summaries",
     "pack_levels",
     "multilevel_attention_forward",
+    "apply_attention_sink",
+    "attention_sink_backward",
+    "apply_output_gate",
     "multilevel_attention_backward",
 ]
 
@@ -577,6 +582,154 @@ def multilevel_attention_forward(
 
 
 # ============================================================
+# Optional post-attention composition: learned sink, output gate.
+#
+# Both are pure composable post-ops over the frozen (out, lse) contract;
+# the attention kernel and the tree are untouched, and autograd provides
+# their backward.
+# ============================================================
+
+def apply_attention_sink(
+    out: torch.Tensor,
+    lse: torch.Tensor,
+    sinks: torch.Tensor,
+) -> torch.Tensor:
+    """
+    out: [B, N, Hq, Dv]   lse: [B, N, Hq] (fp32, natural log)   sinks: [Hq]
+
+        out_sink = out * sigmoid(lse - sinks[h])
+
+    Equivalent to one extra softmax entry per query head with logit
+    sinks[h] and an identically-zero value: the denominator gains
+    exp(sinks[h]), the numerator is unchanged. No sink K/V token exists and
+    nothing enters the KV cache. Sinks index QUERY heads (GQA: [Hq], not
+    [Hkv]). The scale is computed in FP32 and cast to out.dtype.
+
+    A zero sink is NOT an identity (it still adds e^0 = 1 to the
+    denominator); only skipping this call reproduces plain attention.
+
+    NOTE: gradient flows into lse (and through it into the attention
+    logits). Autograd handles this; for the explicit path, use
+    attention_sink_backward to get (dout_pre, dlse, dsinks) and pass dlse
+    into multilevel_attention_backward(..., dlse=dlse).
+
+    TODO(kernel): fuse into the online softmax (the sink joins the m/l
+    running statistics as one extra logit, contributing zero to acc); stop
+    exposing lse once fused -- the dlse contract in
+    multilevel_attention_backward already specifies the extra backward term.
+    """
+    B, N, Hq, Dv = out.shape
+    if tuple(lse.shape) != (B, N, Hq):
+        raise ValueError(
+            f"lse shape {tuple(lse.shape)} != {(B, N, Hq)}"
+        )
+    if tuple(sinks.shape) != (Hq,):
+        raise ValueError(
+            f"sinks shape {tuple(sinks.shape)} != {(Hq,)} (one logit per "
+            f"query head)"
+        )
+    scale = torch.sigmoid(lse.float() - sinks.float()[None, None, :])
+    return out * scale.unsqueeze(-1).to(out.dtype)
+
+
+def attention_sink_backward(
+    out: torch.Tensor,
+    lse: torch.Tensor,
+    sinks: torch.Tensor,
+    dout: torch.Tensor,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """
+    VJP of apply_attention_sink at the (out, lse) boundary.
+
+    out/lse/sinks: as in apply_attention_sink.  dout: [B, N, Hq, Dv], the
+    gradient wrt the POST-sink output.  Returns
+
+        dout_pre [B, N, Hq, Dv] (dout.dtype)  gradient wrt the pre-sink out
+        dlse     [B, N, Hq]     (float32)     gradient wrt the forward lse
+        dsinks   [Hq]           (sinks.dtype)
+
+    With r = sigmoid(lse - sinks):  dout_pre = r * dout,
+    dlse = <dout, out> * r * (1 - r),  dsinks = -sum_{b,n} dlse.
+
+    This mirrors apply_attention_sink's mixed-precision graph, including
+    the forward cast of r to out.dtype. The VJP matches torch.autograd
+    within floating-point precision (dout_pre is typically bitwise; dlse
+    and dsinks may differ by fp32 rounding since autograd's sigmoid
+    backward need not use the same operation ordering as r * (1 - r)).
+
+    Requires dout.dtype == out.dtype (what autograd produces); a manually
+    supplied fp32 dout for a bf16 out would not represent the VJP of the
+    actual mixed-precision forward.
+
+    Composition with the explicit Phase-2 backward:
+
+        dout_pre, dlse, dsinks = attention_sink_backward(out, lse, sinks, g)
+        dq, dk_p, dv_p, _ = multilevel_attention_backward(
+            q, packed, out, lse, dout_pre, fmap, cache_size, dlse=dlse)
+    """
+    B, N, Hq, Dv = out.shape
+    if tuple(lse.shape) != (B, N, Hq):
+        raise ValueError(f"lse shape {tuple(lse.shape)} != {(B, N, Hq)}")
+    if tuple(sinks.shape) != (Hq,):
+        raise ValueError(
+            f"sinks shape {tuple(sinks.shape)} != {(Hq,)} (one logit per "
+            f"query head)"
+        )
+    if tuple(dout.shape) != (B, N, Hq, Dv):
+        raise ValueError(
+            f"dout shape {tuple(dout.shape)} != {(B, N, Hq, Dv)}"
+        )
+    if dout.dtype != out.dtype:
+        raise ValueError(
+            f"dout dtype {dout.dtype} must match out dtype {out.dtype}"
+        )
+    r = torch.sigmoid(lse.float() - sinks.float()[None, None, :])  # fp32
+    r_out = r.to(out.dtype)                     # the forward's exact cast
+    dout_pre = dout * r_out.unsqueeze(-1)       # same-dtype math as forward
+    # VJP through (out * r_out): grad wrt r_out is <dout, out> summed over
+    # Dv in the output dtype; the cast-backward then promotes to fp32.
+    g_dot = (dout * out).sum(dim=-1).float()
+    dlse = g_dot * r * (1.0 - r)                # sigmoid backward, fp32
+    dsinks = (-dlse).sum(dim=(0, 1)).to(sinks.dtype)
+    return dout_pre, dlse, dsinks
+
+
+def apply_output_gate(
+    out: torch.Tensor,
+    x: torch.Tensor,
+    gate_weight: torch.Tensor,
+) -> torch.Tensor:
+    """
+    out: [B, N, Hq, Dv]   x: [B, N, emb_dim]   gate_weight: [Hq*Dv, emb_dim]
+
+        gated = SiLU(x @ gate_weight^T).reshape(B, N, Hq, Dv) * out
+
+    x is the ORIGINAL attention-input hidden state (pre-projection
+    query-side, no RoPE/positional transforms). SiLU, not sigmoid -- the
+    gate may suppress, amplify, or go slightly negative. Applied after
+    attention (and after any sink rescale), before the output projection.
+    Ordinary mixed precision; no FP32 requirement. No cache/decode state:
+    at decode the gate is recomputed from the current token's hidden state.
+
+    TODO(perf): optionally fuse SiLU(gate) * out into the output-projection
+    input epilogue if profiling shows it matters.
+    """
+    B, N, Hq, Dv = out.shape
+    if x.dim() != 3 or x.shape[0] != B or x.shape[1] != N:
+        raise ValueError(
+            f"x shape {tuple(x.shape)} incompatible with out "
+            f"{tuple(out.shape)}; expected [B, N, emb_dim]"
+        )
+    if tuple(gate_weight.shape) != (Hq * Dv, x.shape[-1]):
+        raise ValueError(
+            f"gate_weight shape {tuple(gate_weight.shape)} != "
+            f"{(Hq * Dv, x.shape[-1])}"
+        )
+    gate = torch.nn.functional.silu(x.matmul(gate_weight.t()))
+    return gate.reshape(B, N, Hq, Dv) * out
+
+
+# ============================================================
 # Phase 2 backward: explicit two-pass FlashAttention-style.
 #
 #   Pass A (Q-owned dQ):    Q-block --fwd_bounds--> K-tiles
@@ -586,8 +739,11 @@ def multilevel_attention_forward(
 #   X  = Q K^T * scale                     scale = 1/sqrt(Dk)
 #   S  = c*tanh(X/c)  (softcap=c) | X      softcap_grad = 1 - tanh(X/c)^2 | 1
 #   P  = exp(S - LSE_q) on valid (q,k), else 0     <- SAVED forward lse
-#   Delta_q = sum_d dO_qd O_qd                     <- computed once
-#   dV += P^T dO      dP = dO V^T      dS = P * (dP - Delta)
+#   Delta_q     = sum_d dO_qd O_qd                 <- computed once
+#   Delta_eff_q = Delta_q - dLSE_q                 <- only if a dlse seed is
+#             given (dLSE/dS_i = P_i, so dS = P(dP - Delta + dlse)
+#             = P(dP - Delta_eff)); the definition of Delta is unchanged
+#   dV += P^T dO      dP = dO V^T      dS = P * (dP - Delta_eff)
 #   dX  = dS * softcap_grad
 #   dQ += scale * dX K                 dK += scale * dX^T Q
 #
@@ -652,6 +808,8 @@ def multilevel_attention_backward(
     block_m: int = 16,
     block_n: int = 32,
     softcap: float = 20.0,
+    *,
+    dlse: Optional[torch.Tensor] = None,
 ):
     """
     Explicit Phase-2 backward at the packed boundary (see block comment).
@@ -661,6 +819,11 @@ def multilevel_attention_backward(
         q        [B, N, Hq, Dk]      out   [B, N, Hq, Dv]
         packed.k [B, sumN, Hkv, Dk]  lse   [B, N, Hq] float32 (saved forward)
         packed.v [B, sumN, Hkv, Dv]  dout  [B, N, Hq, Dv]
+        dlse     [B, N, Hq] floating, optional (keyword-only): gradient seed
+                 wrt the RETURNED lse, e.g. from a downstream attention sink
+                 (see attention_sink_backward). Since dLSE/dS_i = P_i it
+                 folds into Delta once: dS = P(dP - (Delta - dlse)). None
+                 reproduces the pre-sink contract bitwise.
 
         dq        [B, N, Hq, Dk]     (q.dtype)
         dk_packed [B, sumN, Hkv, Dk] (packed.k.dtype)
@@ -698,6 +861,15 @@ def multilevel_attention_backward(
 
     # Delta_q = sum_d dO_qd O_qd = sum_k P_qk dP_qk: no pre-pass over KV.
     delta = (dout.float() * out.float()).sum(dim=-1)  # [B, N, Hq]
+    if dlse is not None:
+        if tuple(dlse.shape) != (B, N, Hq):
+            raise ValueError(
+                f"dlse shape {tuple(dlse.shape)} != {(B, N, Hq)}"
+            )
+        if not dlse.dtype.is_floating_point:
+            raise ValueError("dlse must have floating dtype")
+        # dS = P (dP - Delta + dlse) since dLSE/dS_i = P_i: fold once here.
+        delta = delta - dlse.float()
 
     dq_acc = torch.zeros(B, N, Hq, Dk, device=device, dtype=torch.float32)
     dk_acc = torch.zeros_like(packed.k, dtype=torch.float32)
