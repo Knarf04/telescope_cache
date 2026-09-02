@@ -145,7 +145,7 @@ def block_hull(
     O(1) replacement for `range_spec.fwd_bounds`, which scans the block.
 
     Both lo(q) and hi(q) are non-decreasing in q (range_spec asserts this;
-    test_range checks it), so
+    test_reference checks it), so
 
         hull = [ lo(q_lo), hi(q_hi - 1) )
 

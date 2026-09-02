@@ -2,14 +2,12 @@
 Clean PyTorch reference implementation of telescoping (multiresolution)
 attention: the algorithm to be implemented in CuTeDSL.
 
-This module contains ONLY the implementation; every historical oracle (scan
-plan, dense flattened-mask reference, loop POCs, analytic range oracles)
-lives in the test files. Behavioral contracts are enforced by:
-
-    test/test_forward.py    forward equivalence chain, (out, lse) contract
-    test/test_backward.py   end-to-end gradient oracle, Phase-2 backward at
-                            the packed boundary, and their composition
-    test/test_range.py      range_spec properties
+This module contains ONLY the implementation; the analytic range oracles
+live in the consolidated test suite. Behavioral contracts are enforced by
+test/test_reference.py: the (out, lse) forward contract and gradients
+against telescope_cache.minimal_reference (the semantic oracle), the
+explicit Phase-2 backward at the packed boundary, and the range_spec
+properties.
 
 Pipeline
 --------
@@ -28,7 +26,8 @@ Pipeline
                                            dposition, stats)            [Phase 2]
 
 Phase-1 backward (gradients of packed K/V back to raw q, k, v, including the
-q/k -> w -> merge-weight path) is left to autograd; see test_backward.py.
+q/k -> w -> merge-weight path) is left to autograd; see
+test/test_reference.py.
 
 Coordinates
 -----------
@@ -139,7 +138,7 @@ def short_conv(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
     (groups = C, no mixing across channels), no bias, no activation. The
     input is cast to FP32, convolved, the residual is ADDED IN FP32, and
     only the final sum is cast back to x.dtype -- this ordering is part of
-    the contract (see test_shortconv.test_fp32_add_ordering), not
+    the contract (see test_reference.test_mixed_precision), not
     x + conv(x).to(dtype).
 
     TODO(decode): incremental decoding requires a rolling state of
@@ -459,7 +458,7 @@ def build_dyadic_summaries(
 
     detach_weights: gradient-only switch (forward values unchanged) that cuts
     the w -> merge-weight gradient branch (q/k in QK mode, x/w_proj in linear
-    mode); used by test_backward.py.
+    mode); used by test/test_reference.py.
 
     Short-conv mode: with k_conv_weight [Hkv*Dk, K] and v_conv_weight
     [Hkv*Dv, K] both given, short_conv is applied to k and v (flattened over

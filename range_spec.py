@@ -41,7 +41,7 @@ required properties are containment only:
     Q_l(k) subset-of bwd_bounds(k_lo, k_hi, l)   for every k in the tile
 
 Exactness of the hulls is a performance property that the tests measure.
-Measured result (test/test_range.py): every single node's inverse set Q_l(k)
+Measured result (test/test_reference.py): every single node's inverse set Q_l(k)
 is contiguous, but the union over a KV window can have holes at fine levels,
 because at a merge step a level momentarily holds no attendable node (e.g.
 the README example, N=8, cache 6, fmap {1:2, 2:3}: L1 is [0,2) at q=5, empty
@@ -104,9 +104,10 @@ def activation_times_from_fmap(fmap: Dict[int, int]) -> Tuple[int, ...]:
     Also enforces dyadic alignment, a[l] mod 2^l == 2^(l-1), without which the
     schedule is not representable by the canonical aligned tree.
 
-    Deliberately duplicates test_forward.compute_dyadic_activation_times /
+    Deliberately duplicates test_reference.compute_dyadic_activation_times /
     validate_dyadic_fmap (the oracle) in pure ints so this module has no test
-    dependency; test_range asserts the two agree on every configuration.
+    dependency; test_reference.test_schedule_properties asserts the two agree
+    on every configuration.
     """
     if not fmap:
         return (0,)

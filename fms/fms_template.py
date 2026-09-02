@@ -247,7 +247,7 @@ class ShortConv1d(nn.Module):
     no bias, no activation. The input is cast to FP32, convolved, the
     residual is ADDED IN FP32, and only the final sum is cast back to the
     input dtype (same contract as telescope_cache.reference.short_conv, the
-    independent oracle; equivalence is enforced by test/test_shortconv.py,
+    independent oracle; equivalence is enforced by test/test_reference.py,
     not by shared code).
 
     TODO(decode): incremental decoding requires a rolling state of

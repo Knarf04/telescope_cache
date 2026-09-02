@@ -7,7 +7,7 @@ Goals:
 TODOs:
 - [ ] Extract Davis' implementation ([training](https://github.com/daviswer/foundation-model-stack-sandbox/blob/telescoping-cache-flex/fms/modules/attention.py), [inference](https://github.com/daviswer/foundation-model-stack-sandbox/blob/telescoping-inference-hybrid/fms/modules/attention.py)) into modules
 - [x] Implement sink token & gated attention ([hf pr](https://github.com/huggingface/transformers/pull/47179)) — `reference.apply_attention_sink`/`apply_output_gate`, `use_sinks`/`use_gate` in `fms/train.py`
-- [x] Think about proper RoPE implementation for aggregated caches — post-summary RoPE (`position_mode="rope"`): a summary is a virtual token at its interval's right endpoint, rotated after aggregation (deliberately NOT the merge of individually-rotated keys); see `multilevel_attention_forward`'s positional-encoding contract and `test/test_position.py`
+- [x] Think about proper RoPE implementation for aggregated caches — post-summary RoPE (`position_mode="rope"`): a summary is a virtual token at its interval's right endpoint, rotated after aggregation (deliberately NOT the merge of individually-rotated keys); see `multilevel_attention_forward`'s positional-encoding contract and `test/test_reference.py`
 
 ## Pipeline
 
@@ -54,14 +54,8 @@ output projection (`dense` in fms/train.py)
 |---|---|
 | `range_spec.py` | Frozen pure-integer range spec: `range_bounds`, `elem_mask`, `fwd_bounds`, `bwd_bounds`, `node_query_bounds`, packed offsets. Level-local coordinates only. |
 | `reference.py` | **The implementation** (extract the kernel from here): summary weights, dyadic builder, `pack_levels`, `multilevel_attention_forward` → `(out, lse)` with optional positional encoding (`position_mode` none/rope/relative: post-summary RoPE at interval right endpoints + learned summary-bin relative bias), explicit two-pass `multilevel_attention_backward` covering all three modes with a fixed 5-field return `(dq, dk_packed, dv_packed, dposition, stats)` -- `dposition` is the `drel_logits` seed in relative mode, else None. No oracles. |
-| `minimal_reference.py` | **The semantic oracle**: deliberately naive pure-PyTorch definition of the full block — per-query visible-entry enumeration via `range_bounds` (chronological, oldest → newest), ordinary `torch.softmax`, literal sink logit + zero value row, relative bin distances literally `arange(M-1..0)`, autograd-only backward. No packed buffers, tiles, online softmax or manual backward; imports only `range_spec`. FP32 semantics only — mixed-precision op ordering stays `reference.py`'s job. Checked against `reference.py` by `test/test_minimal_reference.py`. |
-| `test/test_forward.py` | Historical oracles (original scan plan, dense flattened-mask reference, loop POCs, analytic range oracles) and the six-configuration forward chain checking `reference.multilevel_attention_forward` — `out` and `lse` — against all of them, with coverage assertions (warm-up, eviction, odd lengths, partial tiles, `Dv≠Dk`, GQA). Defines `CASES`. |
-| `test/test_backward.py` | Part 1: end-to-end autograd gradient oracle (original chain vs `reference.py`, incl. the `q/k → w →` summary-tree path, `detach_weights`, `dv` invariance). Part 2: `reference.multilevel_attention_backward` vs autograd at the packed boundary (saved-LSE reconstruction, softcap derivative, never-visible nodes, conservative-hull tile). Part 3: explicit Phase 2 + autograd Phase-1 VJP ≡ Part-1 oracle. The Phase-2 backward contract also takes an optional keyword-only `dlse` seed (gradient wrt the returned lse, for attention-sink support; `None` = legacy behavior, tested in `test_sink_gate.py`). |
-| `test/test_range.py` | Exhaustive property tests of `range_spec` at small N against the analytic range oracles. |
-| `test/test_shortconv.py` | Unit contract for the optional short causal depthwise K/V conv (`reference.short_conv` / `fms_template.ShortConv1d`, enabled in `fms/train.py` via `use_kv_short_conv`; `fms/inference.py` has no conv support yet): causality, hand-loop equivalence, FP32 residual-add ordering, K=1, channel independence, zero-init identity, K/V parameter independence, error paths, e2e gradients. Training-only; decode TODOs live on the modules. |
-| `test/test_sink_gate.py` | Unit contract for the learned attention sink and SiLU output gate (`reference.apply_attention_sink` / `apply_output_gate`; enabled in `fms/train.py` via `use_sinks` / `use_gate`, absent from `fms/inference.py`): sink vs a literal augmented-softmax oracle in forward AND gradients (catches a dropped lse gradient path), zero-sink ≠ identity, SiLU gate exactness incl. GQA / `Dv≠Dk` / bf16, four-combo e2e composition with grads to `sinks`/`gate_proj`, error paths, and the explicit-backward composition `attention_sink_backward` → `multilevel_attention_backward(dlse=...)` vs autograd, with a negative control for the dropped-LSE-path failure mode. Post-ops over the frozen `(out, lse)` contract — the kernel suites are unaffected. |
-| `test/test_position.py` | Positional-encoding contract (`position_mode` none/rope/relative): NoPE bitwise regression; post-summary RoPE vs dense causal RoPE oracles on L0-only schedules (full, windowed, empty-coarse-level); right-endpoint position units; analytic 0-based summary-bin distances vs the slow range oracle across three schedules, incl. the partition property and cross-level span independence; dense relative-bias oracle; gradient flow to `relative_weight`/`relative_proj`/q/k/x; tree position-independence; explicit RoPE Phase-2 backward (rotate Q/K in the tile loops, inverse-rotate the accumulated dQ/dK) and explicit relative Phase-2 backward (reconstruct the pre-softcap bias in both passes, scatter dX into summary bins in Pass A, return the `drel_logits` seed composed to dstates/dproj) vs autograd at the packed boundary on the tiny and eviction geometries, incl. softcap=None and negative controls; sink-dlse composition (`attention_sink_backward` -> `multilevel_attention_backward(dlse=...)`) for both positional modes with dropped-dlse negative controls; Phase-2 + Phase-1 composition (explicit backward + tree VJP == end-to-end autograd, incl. the q->w path via a dropped-tree negative control) for both positional modes on tiny and eviction geometries; full-block composition (x -> Wq/Wk/Wv -> flat K/V short conv -> tree -> positional attention -> sink -> gate -> o_proj: explicit Phase-2 + sink backwards + autograd VJPs at the documented seams == pure autograd for all trainable parameters, both weight modes, with dropped-gate-path and dropped-dlse negative controls); error paths. Training-only; decode + CuTeDSL kernel support are TODOs on the forward. |
-| `test/test_minimal_reference.py` | `minimal_reference.py` vs `reference.py`, exploiting their structural independence: visible-entry lists vs the range oracle; per-pair summary tree vs the strided builder (qk/linear/sconv, odd lengths); ordinary softmax vs tiled online softmax (`out` AND `lse`, five geometries incl. eviction, GQA×3, `Dv≠Dk`, four levels, softcap=None); post-summary RoPE with independently built tables; `arange(M-1..0)` bins vs the analytic tile-rank formula; literal sink token vs the `sigmoid(lse−s)` rescale; full-block forward; and minimal pure-autograd gradients vs the explicit-composition backward (Phase-2 + sink dlse + tree VJP) for all leaves in all three position modes plus an eviction run. |
+| `minimal_reference.py` | **The semantic oracle**: deliberately naive pure-PyTorch definition of the full block — per-query visible-entry enumeration via `range_bounds` (chronological, oldest → newest), ordinary `torch.softmax`, literal sink logit + zero value row, relative bin distances literally `arange(M-1..0)`, autograd-only backward. No packed buffers, tiles, online softmax or manual backward; imports only `range_spec`. FP32 semantics only — mixed-precision op ordering stays `reference.py`'s job. Checked against `reference.py` by `test/test_reference.py`. |
+| `test/test_reference.py` | **The consolidated CPU suite** (single entrypoint): Section 1 checks `range_spec` against the analytic range oracles and hand-derived goldens (range/elem/mono/fwd-exactness/inverse-contiguity/bwd-containment/domain over six schedules) plus positional-bin properties and per-geometry coverage pins; Section 2 compares two implementations selected via `--compare {mini,ref,flex}` (default `mini ref`) over a curated feature matrix (qk/linear weights, short conv, none/rope/relative, sink, gate, o_proj, softcap=None) at the frozen `(out, lse)` boundary and at the block output; Section 3 pins the packed-boundary Phase-2 backward contract (dq/dk_packed/dv_packed/dposition individually vs autograd, plus the sink-dlse seam -- the future CuTeDSL backward interface), full-block gradients (mini autograd vs the explicit composition; pure autograd for flex pairs), never-visible-node zero-grads and `detach_weights` invariants; Section 4 carries the non-comparison contracts: bf16/fp32-ordering, `ShortConv1d` module checks, negative controls (dropped dlse/tree/gate must fail; SiLU guard; sink-0 != identity), and ~40 error paths. `--compare ref flex` / `mini flex` needs torch >= 2.5 + CUDA and SKIPs cleanly otherwise. |
 | `cute/ranges.py` | Branch-free closed forms of `range_spec` (`+ - * >> min max` only, no data-dependent `if`), so one source runs on host ints, torch tensors and CuTeDSL Int32. Replaces `fwd_bounds`' block scan with an O(1) hull. |
 | `cute/packing.py` | Block-aligned level-major K/V: each level padded (with **zeros**) up to a multiple of `tile_n`, so a level-local tile index is a compile-time offset from the level's block base and no K/V copy needs seqlen predication. |
 | `cute/flash_fwd_telescope.py` | **The kernel.** FA4's `FlashAttentionForwardSm80` with the block schedule and the mask replaced; loads, GEMMs, online softmax and epilogue inherited. Introduces the *virtual block index* so FA4's contiguous-descending pipeline can drive a union of L+1 disjoint block ranges. |
@@ -78,22 +72,27 @@ output projection (`dense` in fms/train.py)
 | `test/sweep_tiles.py` | GPU sweep of (tile_m, tile_n, num_threads) validating that model. |
 
 For kernel work: `reference.py` + `range_spec.py` define **what to implement**;
-the test files define **what must still pass**. The oracle implementations in
-`test_forward.py` are deliberately *not* part of the clean module.
+`test/test_reference.py` defines **what must still pass**. The analytic range
+oracles live inside that suite and are deliberately *not* part of the clean
+module.
 
 Run everything (CPU, from `test/`):
 
 ```bash
-python test_range.py && python test_forward.py --device cpu && python test_backward.py --device cpu && python test_shortconv.py --device cpu && python test_sink_gate.py --device cpu && python test_position.py --device cpu && python test_minimal_reference.py --device cpu
+python test_reference.py --device cpu          # mini vs ref (default pair)
+python test_reference.py --compare ref flex --device cuda   # on the GPU box
 ```
 
-Kernel work (needs a CUDA device and `flash_attn_4`; from `test/`):
+**TODO (GPU / CuTeDSL)** -- the kernel-side suites remain to be written for
+the GPU machine (needs a CUDA device and `flash_attn_4`; from `test/`).
+Flex equivalence is already covered by `test_reference.py --compare ref flex`,
+which anchors the kernel work to the code that actually trains:
 
 ```bash
-python test_cute_ranges.py                 # CPU, no GPU needed
-python test_cute_forward.py                # fwd kernel + mask_mod vs the reference
-python test_cute_backward.py               # bwd kernel vs the reference
-python test_flex_equivalence.py            # vs fms/train.py's flex_attention
+python test_reference.py --compare ref flex --device cuda   # exists today
+python test_cute_ranges.py                 # TODO: cute/ranges.py vs range_spec
+python test_cute_forward.py                # TODO: fwd kernel + mask_mod vs reference
+python test_cute_backward.py               # TODO: bwd kernel vs reference
 python analyze_tiles.py                    # CPU: where the work goes
 python bench_forward.py                    # timings
 python sweep_tiles.py                      # tile tuning
@@ -172,8 +171,9 @@ mask. The tests under `test/` show the same attention can be expressed over a
 **canonical dyadic summary tree** with contiguous per-level storage, which is
 what a custom GPU kernel wants. The two hold identical values; they differ in
 how entries are *addressed*. `reference.py` is the FlashAttention-shaped
-implementation over the dyadic tree; `test/test_forward.py` carries the
-equivalence chain from the original scan/mask semantics through to it.
+implementation over the dyadic tree; `test/test_reference.py` checks it
+against `minimal_reference.py` (the semantic oracle), the analytic range
+oracles, and -- via `--compare ref flex` -- the original flex training path.
 
 ### Worked example
 
