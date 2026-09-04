@@ -36,6 +36,11 @@ Structure
     Section 4  contracts: mixed-precision (bf16/fp32-ordering), the fms
                ShortConv1d module, negative controls (test power), error
                paths (always runs)
+    Section 5  incremental decode: reference.decode_step fed one token at
+               a time vs the full-sequence ref and mini rows, ring-state
+               equality with a full-tree hand-off, visible-set / RoPE
+               position / bin-distance oracles at every step, and ring
+               capacities over whole schedules (always runs)
 
 Attention-boundary terminology (frozen): `out` is the POST-sink attention
 output whenever the sink is enabled; `lse` is ALWAYS the pre-sink ordinary
@@ -67,6 +72,7 @@ sys.path.insert(0, os.path.abspath(os.path.join(_HERE, "..", "..")))
 from telescope_cache.range_spec import (  # noqa: E402
     EMPTY,
     RangeSpec,
+    activation_times_from_fmap,
     bwd_bounds,
     elem_mask,
     fwd_bounds,
@@ -98,6 +104,14 @@ from telescope_cache.reference import (  # noqa: E402
     rope_tables,
     short_conv,
     summary_token_position,
+    # Incremental decode (Section 5).
+    advance_decode_state,
+    decode_capacities,
+    decode_step,
+    init_decode_state,
+    multilevel_attention_decode,
+    ring_slot,
+    short_conv_step,
 )
 from telescope_cache.fms.fms_template import ShortConv1d  # noqa: E402
 
@@ -496,7 +510,8 @@ def _spec(g):
 
 def make_case_params(seed, case, g, device):
     B, N, Hq, Hkv, Dk, Dv = (g[s] for s in ("B", "N", "Hq", "Hkv", "Dk", "Dv"))
-    emb, Kc, d_rel = _EMB, _KC, _DREL
+    # `kc` overrides the conv kernel size (decode cases pin K = 1).
+    emb, Kc, d_rel = _EMB, case.get("kc", _KC), _DREL
     torch.manual_seed(seed)
     base = dict(
         x=torch.randn(B, N, emb, device=device),
@@ -1999,8 +2014,301 @@ def test_error_paths(ctx):
     # The causality guard itself (no aligned fmap can violate it).
     ve("summary causality", lambda: _check_summary_causality(
         RangeSpec(activation_times=(0, 0), cache_size=6, seq_len=8)))
+
+    # decode API (Section 5). Every lambda gets a fresh state: advance /
+    # decode_step mutate the state before some of the checks fire.
+    kl_w, vl_w, wl_w = build_dyadic_summaries(q, k, v, L)
+
+    def fresh(**kw):
+        return init_decode_state(kl_w, vl_w, wl_w, g["fmap"], g["cache"], **kw)
+
+    q1, k1, v1, x1 = q[:, :1], k[:, :1], v[:, :1], x[:, :1]
+    vcw = torch.randn(Hkv * Dv, 3, device=device)
+    ve("decode q_t not one token",
+       lambda: multilevel_attention_decode(q, fresh()))
+    ve("decode Dk mismatch",
+       lambda: multilevel_attention_decode(q_odd[:, :1], fresh()))
+    ve("decode unknown mode", lambda: multilevel_attention_decode(
+        q1, fresh(), position_mode="alibi"))
+    ve("decode rope args with none", lambda: multilevel_attention_decode(
+        q1, fresh(), rope_cos=cos, rope_sin=sin))
+    # The state's query is t = N-1, so the tables must cover N positions.
+    ve("decode short rope table", lambda: multilevel_attention_decode(
+        q1, fresh(), position_mode="rope",
+        rope_cos=cos[:N - 1], rope_sin=sin[:N - 1]))
+    ve("decode table too small", lambda: multilevel_attention_decode(
+        q1, fresh(), position_mode="relative",
+        relative_states=states[:, :1],
+        relative_proj=torch.randn(_DREL, 2, device=device)))
+    ve("decode k_t shape",
+       lambda: advance_decode_state(fresh(), q1, k1[:, :, :1], v1))
+    ve("decode one-sided conv", lambda: advance_decode_state(
+        fresh(), q1, k1, v1, k_conv_weight=kcw))
+    ve("decode conv weights without conv state",
+       lambda: advance_decode_state(
+           fresh(), q1, k1, v1, k_conv_weight=kcw, v_conv_weight=vcw))
+    ve("decode conv state without weights", lambda: advance_decode_state(
+        fresh(k_pre_conv=k, v_pre_conv=v, conv_kernel_size=3), q1, k1, v1))
+    ve("decode init pre-conv without kernel size",
+       lambda: fresh(k_pre_conv=k, v_pre_conv=v))
+    ve("decode init one-sided pre-conv",
+       lambda: fresh(k_pre_conv=k, conv_kernel_size=3))
+    ve("decode init zero kernel",
+       lambda: fresh(k_pre_conv=k, v_pre_conv=v, conv_kernel_size=0))
+    ve("decode linear without w_proj", lambda: decode_step(
+        x1, q1, k1, v1, fresh(), weight_mode="linear"))
+    ve("decode w_proj with qk", lambda: decode_step(
+        x1, q1, k1, v1, fresh(),
+        w_proj=torch.randn(Hkv, _EMB, device=device)))
+    ve("decode relative without weight", lambda: decode_step(
+        x1, q1, k1, v1, fresh(), position_mode="relative",
+        relative_proj=proj))
+    ve("decode relative weight with none", lambda: decode_step(
+        x1, q1, k1, v1, fresh(),
+        relative_weight=torch.randn(Hq * _DREL, _EMB, device=device)))
+    ve("conv step state shape", lambda: short_conv_step(
+        x1, torch.zeros(B, 5, _EMB, device=device),
+        torch.randn(_EMB, 3, device=device)))
+    ve("conv step multi-token x", lambda: short_conv_step(
+        x, torch.zeros(B, 2, _EMB, device=device),
+        torch.randn(_EMB, 3, device=device)))
+    ve("caps bad a[0]", lambda: decode_capacities((1, 3), 6))
+    ve("ring_slot negative", lambda: ring_slot(fresh(), 0, -1))
+    ve("ring_slot level", lambda: ring_slot(fresh(), L + 1, 0))
     print("  error-paths             ValueError on misuse "
-          "(ref fwd/bwd + sink/gate/conv + minimal API) PASS")
+          "(ref fwd/bwd + sink/gate/conv + minimal API + decode) PASS")
+
+
+# ===========================================================================
+# Section 5 -- incremental decode (always runs).
+#
+# reference.decode_step is proven by feeding tokens one at a time:
+#   (a) every decoded row matches the full-sequence reference AND minimal
+#       rows (out post-sink/gate/o_proj, lse pre-sink),
+#   (b) the ring state after the last step matches init_decode_state built
+#       from the full-sequence tree (live slots, conv state, t),
+#   (c) at every step the gathered (level, j) set, RoPE positions and bin
+#       distances match the semantic oracles,
+#   (d) the per-level ring capacities never collide over whole schedules.
+# ===========================================================================
+
+DECODE_CASES = [
+    _case("plain", ["tiny", "evict", "evict_gqa3", "odd_n", "four_levels"]),
+    _case("linear", ["tiny", "odd_n"], weights="linear"),
+    _case("conv", ["tiny", "four_levels"], conv=True),
+    dict(_case("conv_k1", ["tiny"], conv=True), kc=1),
+    _case("rope", ["tiny", "evict"], position="rope"),
+    _case("relative", ["tiny", "evict", "four_levels"], position="relative"),
+    _case("sink", ["tiny", "evict"], sink=True),
+    _case("gate", ["tiny"], gate=True),
+    _case("nocap", ["tiny"], softcap=None),
+    _case("full_none", ["tiny", "evict"], weights="linear", conv=True,
+          sink=True, gate=True, o_proj=True),
+    _case("full_rope", ["tiny"], conv=True, position="rope",
+          sink=True, gate=True, o_proj=True),
+    _case("full_relative", ["tiny"], conv=True, position="relative",
+          sink=True, gate=True, o_proj=True),
+]
+# Decoded tail lengths m: prefill N-m tokens, decode m. "all" decodes the
+# whole sequence from a one-token prefill.
+DECODE_TAILS = (1, 3, 7, "all")
+
+
+def _prefix_params(t, n):
+    return {k: (v[:, :n] if k == "x" else v) for k, v in t.items()}
+
+
+def _prefill_state(t, case, g, device, n):
+    """init_decode_state from the reference tree of the first n tokens."""
+    B, Hq, Hkv, Dk, Dv = (g[s] for s in ("B", "Hq", "Hkv", "Dk", "Dv"))
+    L = len(g["fmap"])
+    g0 = dict(g, N=n)
+    t0 = _prefix_params(t, n)
+    q0, k0, v0 = _projections(t0, g0)
+    bd_kwargs, init_kwargs = {}, {}
+    if case["conv"]:
+        bd_kwargs.update(k_conv_weight=t["kcw"], v_conv_weight=t["vcw"])
+        init_kwargs.update(k_pre_conv=k0, v_pre_conv=v0,
+                           conv_kernel_size=t["kcw"].shape[1])
+    if case["weights"] == "linear":
+        bd_kwargs.update(x=t0["x"], w_proj=t["w_proj"])
+    kl, vl, wl = build_dyadic_summaries(q0, k0, v0, L, **bd_kwargs)
+    return init_decode_state(kl, vl, wl, g["fmap"], g["cache"], **init_kwargs)
+
+
+def _decode_tail(t, case, g, device, m):
+    """Prefill N-m tokens, decode the last m one at a time. Returns the
+    decoded rows (final = post-sink/gate/o_proj, lse = pre-sink), the
+    final state and the per-step structural stats."""
+    B, N, Hq, Hkv, Dk, Dv = (g[s] for s in ("B", "N", "Hq", "Hkv", "Dk", "Dv"))
+    n0 = N - m
+    state = _prefill_state(t, case, g, device, n0)
+    cos = sin = None
+    if case["position"] == "rope":
+        cos, sin = rope_tables(N, Dk, device=device)
+    finals, lses, stats = [], [], []
+    for i in range(m):
+        ti = n0 + i
+        xi = t["x"][:, ti:ti + 1]
+        qi = xi.matmul(t["Wq"].t()).view(B, 1, Hq, Dk)
+        ki = xi.matmul(t["Wk"].t()).view(B, 1, Hkv, Dk)
+        vi = xi.matmul(t["Wv"].t()).view(B, 1, Hkv, Dv)
+        out, lse = decode_step(
+            xi, qi, ki, vi, state,
+            weight_mode=case["weights"], w_proj=t.get("w_proj"),
+            k_conv_weight=t.get("kcw"), v_conv_weight=t.get("vcw"),
+            block_n=g["bn"], softcap=case["softcap"],
+            position_mode=case["position"], rope_cos=cos, rope_sin=sin,
+            relative_weight=t.get("rel_w"), relative_proj=t.get("rel_proj"),
+            sinks=t.get("sinks"), gate_weight=t.get("gate_w"))
+        if state.t != ti + 1:
+            raise AssertionError(f"state.t={state.t} after token {ti}")
+        check_lse_contract("decode", lse, B, 1, Hq)
+        if case["o_proj"]:
+            out = out.reshape(B, 1, Hq * Dv).matmul(t["o_w"].t())
+        # Structural view of the same query (the attention is a pure read).
+        rel_states = None
+        if case["position"] == "relative":
+            rel_states = compute_relative_states(xi, t["rel_w"], Hq)
+        _, _, st = multilevel_attention_decode(
+            qi, state, block_n=g["bn"], softcap=case["softcap"],
+            position_mode=case["position"], rope_cos=cos, rope_sin=sin,
+            relative_states=rel_states, relative_proj=t.get("rel_proj"))
+        finals.append(out)
+        lses.append(lse)
+        stats.append((ti, st))
+    return dict(final=torch.cat(finals, dim=1), lse=torch.cat(lses, dim=1),
+                state=state, stats=stats)
+
+
+def _check_state(label, got, want, case):
+    """Ring states agree on every live slot (+ conv state, t)."""
+    if got.t != want.t:
+        raise AssertionError(f"{label}: t {got.t} != {want.t}")
+    if got.caps != want.caps or got.ring_offsets != want.ring_offsets:
+        raise AssertionError(f"{label}: ring geometry differs")
+    spec = want.spec(want.t)
+    for level in range(spec.num_levels):
+        lo, hi = range_bounds(spec, want.t - 1, level)
+        if lo == hi:
+            continue
+        slots = torch.tensor([ring_slot(want, level, j) for j in range(lo, hi)],
+                             device=want.k.device)
+        report(f"{label} k L{level}", got.k[:, slots], want.k[:, slots])
+        report(f"{label} v L{level}", got.v[:, slots], want.v[:, slots])
+        report(f"{label} w L{level}", got.w[:, slots], want.w[:, slots])
+    if case["conv"]:
+        report(f"{label} conv_k", got.conv_k, want.conv_k)
+        report(f"{label} conv_v", got.conv_v, want.conv_v)
+    elif got.conv_k is not None or want.conv_k is not None:
+        raise AssertionError(f"{label}: unexpected conv state")
+
+
+def _check_visible(label, stats, case, g):
+    """Gathered entries / positions / distances vs the semantic oracles."""
+    for ti, st in stats:
+        spec = RangeSpec.from_fmap(g["fmap"], g["cache"], ti + 1)
+        entries = st["entries"]
+        if len(set(entries)) != len(entries):
+            raise AssertionError(f"{label} t={ti}: duplicate entries")
+        got = sorted(entries, key=lambda e: e[1] << e[0])
+        want = minimal_visible_entries(spec, ti)
+        if got != want:
+            raise AssertionError(
+                f"{label} t={ti}: visible set {got} != {want}")
+        if case["position"] == "rope":
+            for (lv, j), p in zip(entries, st["positions"]):
+                if p != summary_token_position(lv, j):
+                    raise AssertionError(
+                        f"{label} t={ti}: rope position of ({lv},{j}) "
+                        f"= {p} != {summary_token_position(lv, j)}")
+        elif case["position"] == "relative":
+            dists = st["distances"]
+            for (lv, j), d in zip(entries, dists):
+                if d != relative_bin_distance(spec, ti, lv, j):
+                    raise AssertionError(
+                        f"{label} t={ti}: distance of ({lv},{j}) = {d} != "
+                        f"{relative_bin_distance(spec, ti, lv, j)}")
+            if sorted(dists) != list(range(len(entries))):
+                raise AssertionError(
+                    f"{label} t={ti}: distances {dists} are not a "
+                    f"permutation of 0..M-1")
+
+
+def test_decode_equivalence(ctx):
+    device = ctx["device"]
+    n_runs = 0
+    for ci, case in enumerate(DECODE_CASES):
+        for geo in case["geos"]:
+            g = GEOS[geo]
+            N = g["N"]
+            base = make_case_params(500 + ci, case, g, device)
+            with torch.no_grad():
+                ref = run_ref(base, case, g, device)
+                mini = None
+                if N <= BACKEND_CAPS["mini"]["max_n"]:
+                    mini = run_mini(base, case, g, device)
+                full_state = _prefill_state(base, case, g, device, N)
+                for tail in DECODE_TAILS:
+                    m = N - 1 if tail == "all" else tail
+                    if not 1 <= m < N:
+                        continue
+                    dec = _decode_tail(base, case, g, device, m)
+                    label = f"decode {case['name']}/{geo}/m={m}"
+                    report(f"{label} out", dec["final"],
+                           ref["final"][:, N - m:])
+                    report(f"{label} lse", dec["lse"],
+                           ref["lse_plain"][:, N - m:])
+                    if mini is not None:
+                        report(f"{label} out vs mini", dec["final"],
+                               mini["final"][:, N - m:])
+                    _check_state(label, dec["state"], full_state, case)
+                    _check_visible(label, dec["stats"], case, g)
+                    n_runs += 1
+    print(f"  decode-equivalence      {n_runs} prefill+decode runs vs "
+          f"ref/mini rows, ring state, visible sets PASS")
+
+
+def test_decode_capacities(ctx):
+    """Ring capacities over whole schedules: no live node ever shares a slot
+    with another live node, every live node sits in its slot, and at most
+    one level >= 1 activates per step (the ruler tick)."""
+    for name, N, cache, fmap, _ in SCHEDULE_CONFIGS:
+        a = activation_times_from_fmap(fmap)
+        caps = decode_capacities(a, cache)
+        spec = RangeSpec(a, cache, N)
+        L = len(a) - 1
+        occupant = [dict() for _ in range(L + 1)]  # slot -> node index
+        for q in range(N):
+            fired = [lv for lv in range(1, L + 1)
+                     if q >= a[lv] and (q - a[lv]) % (1 << lv) == 0]
+            if len(fired) > 1:
+                raise AssertionError(
+                    f"{name}: levels {fired} activate together at q={q}")
+            created = [(0, q)] + [(lv, (q - a[lv]) >> lv) for lv in fired]
+            for lv, j in created:
+                s = j % caps[lv]
+                prev = occupant[lv].get(s)
+                if prev is not None:
+                    lo, hi = range_bounds(spec, q, lv)
+                    if lo <= prev < hi:
+                        raise AssertionError(
+                            f"{name}: node ({lv},{j}) overwrites live node "
+                            f"({lv},{prev}) at q={q} (cap {caps[lv]})")
+                occupant[lv][s] = j
+            for lv in range(L + 1):
+                lo, hi = range_bounds(spec, q, lv)
+                if hi - lo > caps[lv]:
+                    raise AssertionError(
+                        f"{name}: level {lv} has {hi - lo} live > cap "
+                        f"{caps[lv]} at q={q}")
+                for j in range(lo, hi):
+                    if occupant[lv].get(j % caps[lv]) != j:
+                        raise AssertionError(
+                            f"{name}: live node ({lv},{j}) not in its slot "
+                            f"at q={q}")
+        print(f"  decode-capacities       {name:<12} caps={caps} "
+              f"(cache {cache}) PASS")
 
 
 # ===========================================================================
@@ -2025,6 +2333,9 @@ TESTS = [
     test_shortconv_module,
     test_negative_controls,
     test_error_paths,
+    # Section 5 -- incremental decode (always runs).
+    test_decode_capacities,
+    test_decode_equivalence,
 ]
 
 

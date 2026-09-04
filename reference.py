@@ -29,6 +29,33 @@ Phase-1 backward (gradients of packed K/V back to raw q, k, v, including the
 q/k -> w -> merge-weight path) is left to autograd; see
 test/test_reference.py.
 
+Incremental decode
+------------------
+    init_decode_state          prefill hand-off: the live nodes of the dyadic
+                               tree at query N-1 -> per-level modular rings
+                               (+ the pre-conv rolling state)
+    decode_step, per token t:
+      short_conv_step          rolling K-1 pre-conv rows       (item: conv)
+      -> merge weight w_t      qk logsumexp | linear
+      -> advance_decode_state  the ONE level whose node activates at t is
+                               merged from its two live children, THEN
+                               token t is written at level 0
+      -> multilevel_attention_decode
+                               query t over range_bounds(spec_{t+1}, t, l),
+                               level by level, same online softmax and the
+                               same positional rules as the forward
+                               (post-summary RoPE at right endpoints,
+                               summary-bin relative bias)
+      -> apply_attention_sink / apply_output_gate       (unchanged post-ops)
+
+The decode cache is addressed by the SAME level-local coordinates as the
+packed prefill buffer: node j of level l lives at physical slot
+ring_offsets[l] + j % caps[l] (ring_slot), and range_bounds alone decides
+what is live -- no dummies, no plan replay, no eviction bookkeeping (an
+evicted node simply leaves the range; its slot is reused caps[l] nodes
+later). Feeding tokens one at a time reproduces the full-sequence rows
+(test/test_reference.py, Section 5).
+
 Coordinates
 -----------
 Range arithmetic (telescope_cache.range_spec) is level-local. Storage
@@ -39,12 +66,14 @@ pack_levels, _packed_slice/_kv_tile and the packed-geometry test only.
 """
 
 import math
+from dataclasses import dataclass
 from typing import Dict, List, NamedTuple, Optional, Tuple
 
 import torch
 
 from telescope_cache.range_spec import (
     RangeSpec,
+    activation_times_from_fmap,
     bwd_bounds,
     elem_mask,
     fwd_bounds,
@@ -69,6 +98,15 @@ __all__ = [
     "attention_sink_backward",
     "apply_output_gate",
     "multilevel_attention_backward",
+    # Incremental decode.
+    "DecodeState",
+    "decode_capacities",
+    "ring_slot",
+    "short_conv_step",
+    "init_decode_state",
+    "advance_decode_state",
+    "multilevel_attention_decode",
+    "decode_step",
 ]
 
 
@@ -141,9 +179,9 @@ def short_conv(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
     the contract (see test_reference.test_mixed_precision), not
     x + conv(x).to(dtype).
 
-    TODO(decode): incremental decoding requires a rolling state of
-    pre-convolution projected K/V values. Current implementation supports
-    full-sequence training/prefill only.
+    Decode: the one-token counterpart is short_conv_step, driven by the
+    rolling state of the last K-1 PRE-conv rows kept in DecodeState
+    (init_decode_state seeds it from the prefill rows).
 
     TODO(padding/packing): current implementation assumes one continuous
     causal sequence per batch row. It does not reset convolution state
@@ -466,7 +504,7 @@ def build_dyadic_summaries(
     layout) BEFORE the merge weights are computed and before the tree is
     built. Both-or-neither; providing exactly one raises. With both None this
     function is bitwise-identical to the pre-conv behavior. See the
-    TODO(decode)/TODO(padding/packing) notes on short_conv.
+    Decode / TODO(padding/packing) notes on short_conv.
     """
     if (k_conv_weight is None) != (v_conv_weight is None):
         raise ValueError(
@@ -634,6 +672,102 @@ def _kv_tile(
 # Phase 2 forward: query-block / KV-tile FlashAttention shape.
 # ============================================================
 
+def _positional_setup(
+    position_mode: str,
+    rope_cos: Optional[torch.Tensor],
+    rope_sin: Optional[torch.Tensor],
+    relative_states: Optional[torch.Tensor],
+    relative_proj: Optional[torch.Tensor],
+    *,
+    B: int,
+    N: int,
+    Hq: int,
+    Dk: int,
+    spec: RangeSpec,
+    rope_positions: int,
+) -> Tuple[Optional[torch.Tensor], int]:
+    """
+    Positional-argument validation shared by the forward, the backward and
+    the decode path -- one error matrix, one place. relative_states must be
+    [B, N, Hq, d_rel] (N = 1 at decode); rope tables must cover positions
+    [0, rope_positions) (N for full sequences, t + 1 at decode).
+    Returns (rel_logits [B, N, Hq, max_relative_bins] float32 | None,
+    max_relative_bins).
+    """
+    if position_mode not in ("none", "rope", "relative"):
+        raise ValueError(
+            f"position_mode must be 'none', 'rope' or 'relative', got "
+            f"{position_mode!r}"
+        )
+    rel_logits = None
+    max_relative_bins = 0
+    if position_mode == "none":
+        if any(t is not None for t in (rope_cos, rope_sin,
+                                       relative_states, relative_proj)):
+            raise ValueError(
+                "positional arguments provided with position_mode='none'"
+            )
+    elif position_mode == "rope":
+        if rope_cos is None or rope_sin is None:
+            raise ValueError(
+                "position_mode='rope' requires rope_cos and rope_sin"
+            )
+        if relative_states is not None or relative_proj is not None:
+            raise ValueError(
+                "relative_* arguments provided with position_mode='rope'"
+            )
+        if Dk % 2 != 0:
+            raise ValueError(f"RoPE requires an even Dk, got {Dk}")
+        if rope_cos.shape != rope_sin.shape:
+            raise ValueError(
+                f"rope_cos shape {tuple(rope_cos.shape)} != rope_sin "
+                f"shape {tuple(rope_sin.shape)}"
+            )
+        if rope_cos.dim() != 2 or rope_cos.shape[-1] * 2 != Dk:
+            raise ValueError(
+                f"rope tables must be [n_pos, {Dk // 2}], got "
+                f"{tuple(rope_cos.shape)}"
+            )
+        if rope_cos.shape[0] < rope_positions:
+            raise ValueError(
+                f"rope tables cover {rope_cos.shape[0]} positions; "
+                f"summary positions reach N-1={rope_positions - 1}"
+            )
+        validate_summary_causality(spec)
+    else:  # "relative"
+        if relative_states is None or relative_proj is None:
+            raise ValueError(
+                "position_mode='relative' requires relative_states and "
+                "relative_proj"
+            )
+        if rope_cos is not None or rope_sin is not None:
+            raise ValueError(
+                "rope_* arguments provided with position_mode='relative'"
+            )
+        if (relative_states.dim() != 4
+                or tuple(relative_states.shape[:3]) != (B, N, Hq)):
+            raise ValueError(
+                f"relative_states shape {tuple(relative_states.shape)} != "
+                f"[{B}, {N}, {Hq}, d_rel]"
+            )
+        if (relative_proj.dim() != 2
+                or relative_proj.shape[0] != relative_states.shape[-1]):
+            raise ValueError(
+                f"relative_proj shape {tuple(relative_proj.shape)} "
+                f"incompatible with d_rel={relative_states.shape[-1]}"
+            )
+        max_relative_bins = relative_proj.shape[1]
+        if max_relative_bins < 1:
+            raise ValueError("relative_proj must have >= 1 bins")
+        validate_summary_causality(spec)
+        # Query-conditioned logits over bin distances, computed once.
+        rel_logits = torch.einsum(
+            "bnhd,dr->bnhr",
+            relative_states.float(), relative_proj.float(),
+        )  # [B, N, Hq, max_relative_bins]
+    return rel_logits, max_relative_bins
+
+
 def multilevel_attention_forward(
     q: torch.Tensor,
     packed: PackedKV,
@@ -717,8 +851,10 @@ def multilevel_attention_forward(
         The bias add promotes scores to FP32 -- the kernel port's
         precision point.
 
-    TODO(decode): incremental positional bookkeeping (RoPE of cached
-    summary entries; virtual-bin distances under cache eviction/merging).
+    Decode: multilevel_attention_decode applies the identical rules to the
+    ring cache -- RoPE positions from (level, j) as here, bin distances from
+    the same _tile_bin_distances at q = t -- so no positional state is ever
+    cached; only unrotated K is.
     TODO(kernel): CuTeDSL RoPE forward/backward; learned-relative score
     bias + parameter gradients in the tile loop.
     TODO(ablation): midpoint / content-weighted summary positions;
@@ -743,77 +879,10 @@ def multilevel_attention_forward(
             f"spec {spec.level_offsets()}"
         )
 
-    if position_mode not in ("none", "rope", "relative"):
-        raise ValueError(
-            f"position_mode must be 'none', 'rope' or 'relative', got "
-            f"{position_mode!r}"
-        )
-    rel_logits = None
-    max_relative_bins = 0
-    if position_mode == "none":
-        if any(t is not None for t in (rope_cos, rope_sin,
-                                       relative_states, relative_proj)):
-            raise ValueError(
-                "positional arguments provided with position_mode='none'"
-            )
-    elif position_mode == "rope":
-        if rope_cos is None or rope_sin is None:
-            raise ValueError(
-                "position_mode='rope' requires rope_cos and rope_sin"
-            )
-        if relative_states is not None or relative_proj is not None:
-            raise ValueError(
-                "relative_* arguments provided with position_mode='rope'"
-            )
-        if Dk % 2 != 0:
-            raise ValueError(f"RoPE requires an even Dk, got {Dk}")
-        if rope_cos.shape != rope_sin.shape:
-            raise ValueError(
-                f"rope_cos shape {tuple(rope_cos.shape)} != rope_sin "
-                f"shape {tuple(rope_sin.shape)}"
-            )
-        if rope_cos.dim() != 2 or rope_cos.shape[-1] * 2 != Dk:
-            raise ValueError(
-                f"rope tables must be [n_pos, {Dk // 2}], got "
-                f"{tuple(rope_cos.shape)}"
-            )
-        if rope_cos.shape[0] < N:
-            raise ValueError(
-                f"rope tables cover {rope_cos.shape[0]} positions; "
-                f"summary positions reach N-1={N - 1}"
-            )
-        validate_summary_causality(spec)
-    else:  # "relative"
-        if relative_states is None or relative_proj is None:
-            raise ValueError(
-                "position_mode='relative' requires relative_states and "
-                "relative_proj"
-            )
-        if rope_cos is not None or rope_sin is not None:
-            raise ValueError(
-                "rope_* arguments provided with position_mode='relative'"
-            )
-        if (relative_states.dim() != 4
-                or tuple(relative_states.shape[:3]) != (B, N, Hq)):
-            raise ValueError(
-                f"relative_states shape {tuple(relative_states.shape)} != "
-                f"[{B}, {N}, {Hq}, d_rel]"
-            )
-        if (relative_proj.dim() != 2
-                or relative_proj.shape[0] != relative_states.shape[-1]):
-            raise ValueError(
-                f"relative_proj shape {tuple(relative_proj.shape)} "
-                f"incompatible with d_rel={relative_states.shape[-1]}"
-            )
-        max_relative_bins = relative_proj.shape[1]
-        if max_relative_bins < 1:
-            raise ValueError("relative_proj must have >= 1 bins")
-        validate_summary_causality(spec)
-        # Query-conditioned logits over bin distances, computed once.
-        rel_logits = torch.einsum(
-            "bnhd,dr->bnhr",
-            relative_states.float(), relative_proj.float(),
-        )  # [B, N, Hq, max_relative_bins]
+    rel_logits, max_relative_bins = _positional_setup(
+        position_mode, rope_cos, rope_sin, relative_states, relative_proj,
+        B=B, N=N, Hq=Hq, Dk=Dk, spec=spec, rope_positions=N,
+    )
 
     out = torch.empty(
         B, N, Hq, Dv, device=q.device, dtype=packed.v.dtype
@@ -1357,73 +1426,12 @@ def multilevel_attention_backward(
     if tuple(packed.level_offsets) != spec.level_offsets():
         raise ValueError("packed level_offsets do not match the schedule")
 
-    # Positional-argument validation mirrors multilevel_attention_forward's.
-    rel_logits = None
-    max_relative_bins = 0
-    if position_mode == "none":
-        if any(t is not None for t in (rope_cos, rope_sin,
-                                       relative_states, relative_proj)):
-            raise ValueError(
-                "positional arguments provided with position_mode='none'"
-            )
-    elif position_mode == "rope":
-        if rope_cos is None or rope_sin is None:
-            raise ValueError(
-                "position_mode='rope' requires rope_cos and rope_sin"
-            )
-        if relative_states is not None or relative_proj is not None:
-            raise ValueError(
-                "relative_* arguments provided with position_mode='rope'"
-            )
-        if Dk % 2 != 0:
-            raise ValueError(f"RoPE requires an even Dk, got {Dk}")
-        if rope_cos.shape != rope_sin.shape:
-            raise ValueError(
-                f"rope_cos shape {tuple(rope_cos.shape)} != rope_sin "
-                f"shape {tuple(rope_sin.shape)}"
-            )
-        if rope_cos.dim() != 2 or rope_cos.shape[-1] * 2 != Dk:
-            raise ValueError(
-                f"rope tables must be [n_pos, {Dk // 2}], got "
-                f"{tuple(rope_cos.shape)}"
-            )
-        if rope_cos.shape[0] < N:
-            raise ValueError(
-                f"rope tables cover {rope_cos.shape[0]} positions; "
-                f"summary positions reach N-1={N - 1}"
-            )
-        validate_summary_causality(spec)
-    else:  # "relative"
-        if relative_states is None or relative_proj is None:
-            raise ValueError(
-                "position_mode='relative' requires relative_states and "
-                "relative_proj"
-            )
-        if rope_cos is not None or rope_sin is not None:
-            raise ValueError(
-                "rope_* arguments provided with position_mode='relative'"
-            )
-        if (relative_states.dim() != 4
-                or tuple(relative_states.shape[:3]) != (B, N, Hq)):
-            raise ValueError(
-                f"relative_states shape {tuple(relative_states.shape)} != "
-                f"[{B}, {N}, {Hq}, d_rel]"
-            )
-        if (relative_proj.dim() != 2
-                or relative_proj.shape[0] != relative_states.shape[-1]):
-            raise ValueError(
-                f"relative_proj shape {tuple(relative_proj.shape)} "
-                f"incompatible with d_rel={relative_states.shape[-1]}"
-            )
-        max_relative_bins = relative_proj.shape[1]
-        if max_relative_bins < 1:
-            raise ValueError("relative_proj must have >= 1 bins")
-        validate_summary_causality(spec)
-        # The forward's exact rel_logits, recomputed once.
-        rel_logits = torch.einsum(
-            "bnhd,dr->bnhr",
-            relative_states.float(), relative_proj.float(),
-        )  # [B, N, Hq, max_relative_bins]
+    # Positional-argument validation mirrors multilevel_attention_forward's
+    # (shared helper); rel_logits is the forward's exact value, recomputed.
+    rel_logits, max_relative_bins = _positional_setup(
+        position_mode, rope_cos, rope_sin, relative_states, relative_proj,
+        B=B, N=N, Hq=Hq, Dk=Dk, spec=spec, rope_positions=N,
+    )
 
     scale = 1.0 / math.sqrt(Dk)
     device = q.device
@@ -1662,3 +1670,648 @@ def multilevel_attention_backward(
         drel_acc,  # None unless position_mode == "relative"
         stats,
     )
+
+
+# ============================================================
+# Incremental decode: per-level modular rings driven by range_spec.
+#
+# State after consuming tokens 0..t-1: for every level l the nodes in
+# range_bounds(spec_t, t-1, l), spec_t = RangeSpec(a, cache_size, t), at
+# physical slots ring_offsets[l] + j % caps[l]. Step t:
+#
+#   1. the one level l >= 1 with t >= a[l] and (t - a[l]) % 2^l == 0 (the
+#      dyadic alignment a[l] = 2^(l-1) mod 2^l makes it unique -- the ruler
+#      tick) creates node j = (t - a[l]) >> l from children (l-1, 2j) and
+#      (l-1, 2j+1), which leave level l-1's range exactly at t and are
+#      therefore still live; the merge is build_dyadic_summaries' pair
+#      merge, softmax(w)-weighted with logsumexp(w) as the parent weight;
+#   2. token t is written at level 0 AFTER the merge (its slot can coincide
+#      with child 2j's when t - 2j == caps[0]);
+#   3. query t attends range_bounds(spec_{t+1}, t, l) per level.
+#
+# caps[l] bounds the live count of level l over the whole schedule (fine
+# counts are periodic once q >= a[l+1]; the coarsest count is bounded by
+# the slots the fine levels leave over), so a contiguous live interval never
+# collides with itself modulo caps[l]. Eviction at the coarsest level is
+# implicit: an evicted node leaves the range and its slot is reused caps[L]
+# nodes later. Every gathered lane is valid by construction (the per-row
+# ranges are exact), so the decode attention needs no element mask; it
+# keeps the forward's level/tile loop only so a decode kernel inherits the
+# same skeleton.
+# ============================================================
+
+@dataclass
+class DecodeState:
+    """
+    One layer's decode cache. Tensors are level-major rings:
+
+        k [B, sum(caps), Hkv, Dk]   UNROTATED, post-conv keys
+        v [B, sum(caps), Hkv, Dv]
+        w [B, sum(caps), Hkv, 1]    merge log-weights (future pair merges)
+        conv_k / conv_v [B, K-1, Hkv*D] | None
+                                    last K-1 PRE-conv flat rows, newest last
+        t                           tokens consumed so far == next query index
+
+    Node j of level l lives at ring_slot(state, l, j); range_bounds alone
+    says which nodes are live. Mutated in place by advance_decode_state.
+    """
+
+    k: torch.Tensor
+    v: torch.Tensor
+    w: torch.Tensor
+    conv_k: Optional[torch.Tensor]
+    conv_v: Optional[torch.Tensor]
+    t: int
+    activation_times: Tuple[int, ...]
+    cache_size: int
+    caps: Tuple[int, ...]
+    ring_offsets: Tuple[int, ...]
+
+    @property
+    def num_levels(self) -> int:
+        return len(self.activation_times)
+
+    def spec(self, seq_len: int) -> RangeSpec:
+        """The prefill schedule truncated to `seq_len` tokens."""
+        return RangeSpec(self.activation_times, self.cache_size, seq_len)
+
+
+def decode_capacities(
+    activation_times: Tuple[int, ...], cache_size: int
+) -> Tuple[int, ...]:
+    """
+    Per-level ring capacities: caps[l] = max_q |R_l(q)| for fine levels and
+    max_q (cache_size - fine usage at q) for the coarsest (its live count is
+    min(remaining, newest + 1) <= remaining). Scanned over two schedule
+    periods past the last activation: every fine count is periodic with
+    period 2^(l+1) once q >= a[l+1], so the joint pattern repeats with
+    period 2^L after a[L]. sum(caps) may exceed cache_size (each ring holds
+    its own level's peak, not the joint peak).
+    """
+    a = tuple(activation_times)
+    if not a or a[0] != 0:
+        raise ValueError("activation_times must start with a[0] = 0")
+    if cache_size <= 0:
+        raise ValueError("cache_size must be positive")
+    L = len(a) - 1
+    horizon = 2 * (a[L] + (1 << (L + 1))) + 1
+    spec = RangeSpec(a, cache_size, horizon)
+    caps = [0] * (L + 1)
+    for q in range(horizon):
+        used = 0
+        for level in range(L):
+            lo, hi = range_bounds(spec, q, level)
+            caps[level] = max(caps[level], hi - lo)
+            used += hi - lo
+        if used > cache_size:
+            raise ValueError(
+                f"fine levels need {used} slots > cache_size={cache_size} "
+                f"at q={q}"
+            )
+        caps[L] = max(caps[L], cache_size - used)
+    return tuple(caps)
+
+
+def ring_slot(state: DecodeState, level: int, j: int) -> int:
+    """Physical slot of node j at `level`: ring_offsets[level] + j % caps[level].
+    The ONLY place that maps a level-local node index to storage."""
+    if not 0 <= level < state.num_levels:
+        raise ValueError(
+            f"level {level} out of range [0, {state.num_levels - 1}]"
+        )
+    if j < 0:
+        raise ValueError(f"node index must be nonnegative, got {j}")
+    return state.ring_offsets[level] + j % state.caps[level]
+
+
+def _ring_slots(
+    state: DecodeState, level: int, indices: torch.Tensor
+) -> torch.Tensor:
+    """Vectorized ring_slot for a level-local index tensor (may wrap)."""
+    return state.ring_offsets[level] + torch.remainder(
+        indices, state.caps[level]
+    )
+
+
+def _conv_history(x_pre: torch.Tensor, kernel_size: int) -> torch.Tensor:
+    """
+    The last K-1 rows of x_pre [B, N, C], left zero-padded when N < K-1
+    (newest row last) -- the rolling state short_conv_step consumes.
+    K == 1 yields an empty [B, 0, C] (Python's x[:, -0:] would be the whole
+    sequence, hence the explicit branch).
+    """
+    history = kernel_size - 1
+    if history == 0:
+        return x_pre[:, :0]
+    pad_rows = max(history - x_pre.shape[1], 0)
+    return torch.nn.functional.pad(x_pre, (0, 0, pad_rows, 0))[:, -history:]
+
+
+def short_conv_step(
+    x: torch.Tensor, state: torch.Tensor, weight: torch.Tensor
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    One-token counterpart of short_conv.
+
+    x: [B, 1, C] current PRE-conv row   state: [B, K-1, C] previous pre-conv
+    rows, newest last   weight: [C, K]   ->  (y [B, 1, C], new_state [B, K-1, C])
+
+        full = cat(state, x)                          [B, K, C]
+        y[b, 0, c] = x[b, 0, c] + sum_j weight[c, j] * full[b, j, c]
+
+    Tap K-1 is the current token, i.e. short_conv's sum at t = the newest
+    row, with the same contract: FP32 taps, residual ADDED IN FP32, one cast
+    back. new_state drops the oldest row. Note the explicit [B, C] + [B, C]
+    residual add (x[:, 0] + y), not [B, 1, C] + [B, C].
+    """
+    if x.dim() != 3 or x.shape[1] != 1:
+        raise ValueError(f"x must be [B, 1, C], got {tuple(x.shape)}")
+    B, _, C = x.shape
+    if weight.dim() != 2 or weight.shape[0] != C:
+        raise ValueError(
+            f"conv weight shape {tuple(weight.shape)} incompatible with "
+            f"C={C}; expected [C, K]"
+        )
+    K = weight.shape[1]
+    if K <= 0:
+        raise ValueError(f"conv kernel size must be positive, got {K}")
+    if tuple(state.shape) != (B, K - 1, C):
+        raise ValueError(
+            f"conv state shape {tuple(state.shape)} != {(B, K - 1, C)}"
+        )
+    full = torch.cat([state, x], dim=1)  # [B, K, C]
+    y = (full.float() * weight.float().t().unsqueeze(0)).sum(dim=1)  # [B, C]
+    out = (x[:, 0].float() + y).to(x.dtype).unsqueeze(1)  # [B, 1, C]
+    return out, full[:, 1:]
+
+
+def init_decode_state(
+    k_levels: List[torch.Tensor],
+    v_levels: List[torch.Tensor],
+    w_levels: List[torch.Tensor],
+    fmap: Dict[int, int],
+    cache_size: int,
+    *,
+    k_pre_conv: Optional[torch.Tensor] = None,
+    v_pre_conv: Optional[torch.Tensor] = None,
+    conv_kernel_size: Optional[int] = None,
+) -> DecodeState:
+    """
+    Prefill -> decode hand-off. k_levels/v_levels/w_levels are
+    build_dyadic_summaries' outputs for the N prefill tokens (post-conv,
+    unrotated); the state receives, for every level, the nodes live at the
+    last prefill query N-1 (range_bounds(spec_N, N-1, l)), and t = N.
+
+    Short-conv mode: pass the RAW pre-conv k/v that went into
+    build_dyadic_summaries ([B, N, Hkv, D] or flat [B, N, Hkv*D]) together
+    with conv_kernel_size; the last K-1 flat rows seed conv_k/conv_v. All
+    three or none.
+    """
+    if (k_pre_conv is None) != (v_pre_conv is None):
+        raise ValueError(
+            "k_pre_conv and v_pre_conv must both be provided or both be None"
+        )
+    if (k_pre_conv is None) != (conv_kernel_size is None):
+        raise ValueError(
+            "conv_kernel_size must accompany the pre-conv rows (and vice versa)"
+        )
+    a = activation_times_from_fmap(fmap)
+    L = len(a) - 1
+    if min(len(k_levels), len(v_levels), len(w_levels)) < L + 1:
+        raise ValueError(
+            f"need {L + 1} levels, got {len(k_levels)}/{len(v_levels)}/"
+            f"{len(w_levels)}"
+        )
+    B, N, Hkv, Dk = k_levels[0].shape
+    Dv = v_levels[0].shape[-1]
+    if N < 1:
+        raise ValueError("prefill must contain at least one token")
+    if tuple(w_levels[0].shape) != (B, N, Hkv, 1):
+        raise ValueError(
+            f"w_levels[0] shape {tuple(w_levels[0].shape)} != "
+            f"{(B, N, Hkv, 1)}"
+        )
+    caps = decode_capacities(a, cache_size)
+    offsets = [0]
+    for c in caps:
+        offsets.append(offsets[-1] + c)
+    total = offsets[-1]
+    state = DecodeState(
+        k=k_levels[0].new_zeros(B, total, Hkv, Dk),
+        v=v_levels[0].new_zeros(B, total, Hkv, Dv),
+        w=w_levels[0].new_zeros(B, total, Hkv, 1),
+        conv_k=None,
+        conv_v=None,
+        t=N,
+        activation_times=a,
+        cache_size=cache_size,
+        caps=caps,
+        ring_offsets=tuple(offsets),
+    )
+    spec = RangeSpec(a, cache_size, N)
+    for level in range(L + 1):
+        lo, hi = range_bounds(spec, N - 1, level)
+        if lo == hi:
+            continue
+        if hi > k_levels[level].shape[1] or hi > v_levels[level].shape[1] \
+                or hi > w_levels[level].shape[1]:
+            raise ValueError(
+                f"level {level}: live range [{lo},{hi}) exceeds the given "
+                f"level tensors"
+            )
+        slots = _ring_slots(
+            state, level,
+            torch.arange(lo, hi, device=state.k.device, dtype=torch.long),
+        )
+        state.k[:, slots] = k_levels[level][:, lo:hi]
+        state.v[:, slots] = v_levels[level][:, lo:hi]
+        state.w[:, slots] = w_levels[level][:, lo:hi]
+    if k_pre_conv is not None:
+        if conv_kernel_size <= 0:
+            raise ValueError(
+                f"conv kernel size must be positive, got {conv_kernel_size}"
+            )
+        if k_pre_conv.shape[:2] != (B, N) or v_pre_conv.shape[:2] != (B, N):
+            raise ValueError(
+                f"pre-conv rows must be [B={B}, N={N}, ...], got "
+                f"{tuple(k_pre_conv.shape)} / {tuple(v_pre_conv.shape)}"
+            )
+        state.conv_k = _conv_history(
+            k_pre_conv.reshape(B, N, -1), conv_kernel_size
+        )
+        state.conv_v = _conv_history(
+            v_pre_conv.reshape(B, N, -1), conv_kernel_size
+        )
+    return state
+
+
+def advance_decode_state(
+    state: DecodeState,
+    q_t: torch.Tensor,
+    k_t: torch.Tensor,
+    v_t: torch.Tensor,
+    *,
+    x_t: Optional[torch.Tensor] = None,
+    w_proj: Optional[torch.Tensor] = None,
+    k_conv_weight: Optional[torch.Tensor] = None,
+    v_conv_weight: Optional[torch.Tensor] = None,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    Consume token t = state.t (in place; state.t becomes t + 1).
+
+    q_t [B, 1, Hq, Dk], k_t [B, 1, Hkv, Dk], v_t [B, 1, Hkv, Dv] are the RAW
+    projections (pre-conv, unrotated). Steps, in this order:
+
+      1. short conv (both weights or neither; the state must have been
+         initialised with pre-conv rows iff weights are given): k/v are
+         convolved on the flat channel layout c = h*D + d via
+         short_conv_step, advancing conv_k/conv_v;
+      2. merge weight w_t: compute_summary_weights(q_t, k_t) on the
+         POST-conv key (QK mode) or compute_linear_weights(x_t, w_proj)
+         (both x_t and w_proj, or neither);
+      3. the one level whose node activates at t is merged from its two
+         live children (build_dyadic_summaries' pair merge);
+      4. token t is written at level 0 -- after the merge.
+
+    Returns (k_t, v_t) as stored (post-conv), for inspection.
+    """
+    t = state.t
+    B, _, Hkv, Dk = state.k.shape
+    Dv = state.v.shape[-1]
+    if q_t.dim() != 4 or q_t.shape[0] != B or q_t.shape[1] != 1 \
+            or q_t.shape[-1] != Dk or q_t.shape[2] % Hkv != 0:
+        raise ValueError(
+            f"q_t shape {tuple(q_t.shape)} incompatible with [B={B}, 1, "
+            f"Hq (multiple of {Hkv}), Dk={Dk}]"
+        )
+    if tuple(k_t.shape) != (B, 1, Hkv, Dk):
+        raise ValueError(
+            f"k_t shape {tuple(k_t.shape)} != {(B, 1, Hkv, Dk)}"
+        )
+    if tuple(v_t.shape) != (B, 1, Hkv, Dv):
+        raise ValueError(
+            f"v_t shape {tuple(v_t.shape)} != {(B, 1, Hkv, Dv)}"
+        )
+
+    # 1. short conv with its rolling pre-conv state.
+    if (k_conv_weight is None) != (v_conv_weight is None):
+        raise ValueError(
+            "k_conv_weight and v_conv_weight must both be provided or both "
+            "be None"
+        )
+    if k_conv_weight is not None:
+        if state.conv_k is None or state.conv_v is None:
+            raise ValueError(
+                "conv weights given but the state was initialised without "
+                "pre-conv rows (init_decode_state k_pre_conv/v_pre_conv)"
+            )
+        k_flat, state.conv_k = short_conv_step(
+            k_t.reshape(B, 1, Hkv * Dk), state.conv_k, k_conv_weight
+        )
+        v_flat, state.conv_v = short_conv_step(
+            v_t.reshape(B, 1, Hkv * Dv), state.conv_v, v_conv_weight
+        )
+        k_t = k_flat.reshape(B, 1, Hkv, Dk)
+        v_t = v_flat.reshape(B, 1, Hkv, Dv)
+    elif state.conv_k is not None:
+        raise ValueError(
+            "the state carries a conv state but no conv weights were given"
+        )
+
+    # 2. merge weight (post-conv key; unpositioned q/k).
+    if (x_t is None) != (w_proj is None):
+        raise ValueError(
+            "x_t and w_proj must both be provided (linear weight mode) or "
+            "both be None (QK weight mode)"
+        )
+    if x_t is not None:
+        w_t = compute_linear_weights(x_t, w_proj)
+        if tuple(w_t.shape) != (B, 1, Hkv, 1):
+            raise ValueError(
+                f"linear weights shape {tuple(w_t.shape)} != {(B, 1, Hkv, 1)}"
+            )
+    else:
+        w_t = compute_summary_weights(q_t, k_t)
+
+    # 3. the ruler tick: at most one level >= 1 activates a node at t.
+    a = state.activation_times
+    L = len(a) - 1
+    fired = None
+    for level in range(1, L + 1):
+        span = 1 << level
+        if t < a[level] or (t - a[level]) % span != 0:
+            continue
+        if fired is not None:
+            raise AssertionError(
+                f"levels {fired} and {level} both activate at t={t}; the "
+                f"schedule is not dyadically aligned"
+            )
+        fired = level
+        j = (t - a[level]) >> level
+        # Children (level-1, 2j) and (level-1, 2j+1) leave level-1's range
+        # exactly at t, so they are live at t-1 (and t >= 1 here).
+        lo_c, hi_c = range_bounds(state.spec(t), t - 1, level - 1)
+        if not (lo_c <= 2 * j and 2 * j + 1 < hi_c):
+            raise AssertionError(
+                f"children of node ({level}, {j}) not live at t-1={t - 1}: "
+                f"level-{level - 1} range [{lo_c},{hi_c})"
+            )
+        c0 = ring_slot(state, level - 1, 2 * j)
+        c1 = ring_slot(state, level - 1, 2 * j + 1)
+        parent = ring_slot(state, level, j)
+        w_children = torch.stack(
+            [state.w[:, c0], state.w[:, c1]], dim=1
+        )  # [B, 2, Hkv, 1] -- the child axis is dim 1
+        alpha = torch.softmax(w_children, dim=1)
+        state.k[:, parent] = (
+            torch.stack([state.k[:, c0], state.k[:, c1]], dim=1) * alpha
+        ).sum(dim=1)
+        state.v[:, parent] = (
+            torch.stack([state.v[:, c0], state.v[:, c1]], dim=1) * alpha
+        ).sum(dim=1)
+        state.w[:, parent] = torch.logsumexp(w_children, dim=1)
+
+    # Capacity invariant at the new query (also validates the schedule).
+    spec_next = state.spec(t + 1)
+    for level in range(L + 1):
+        lo, hi = range_bounds(spec_next, t, level)
+        if hi - lo > state.caps[level]:
+            raise AssertionError(
+                f"level {level} needs {hi - lo} live slots > cap "
+                f"{state.caps[level]} at t={t}"
+            )
+
+    # 4. token t at level 0, after the merge.
+    slot0 = ring_slot(state, 0, t)
+    state.k[:, slot0] = k_t[:, 0]
+    state.v[:, slot0] = v_t[:, 0]
+    state.w[:, slot0] = w_t[:, 0]
+    state.t = t + 1
+    return k_t, v_t
+
+
+def multilevel_attention_decode(
+    q_t: torch.Tensor,
+    state: DecodeState,
+    *,
+    block_n: int = 32,
+    softcap: float = 20.0,
+    position_mode: str = "none",
+    rope_cos: Optional[torch.Tensor] = None,
+    rope_sin: Optional[torch.Tensor] = None,
+    relative_states: Optional[torch.Tensor] = None,
+    relative_proj: Optional[torch.Tensor] = None,
+):
+    """
+    Attention of the most recently consumed token (query index t = state.t
+    - 1) over its multiresolution KV set, read from the ring cache:
+
+      for level
+        [k_lo, k_hi) = range_bounds(spec_{t+1}, t, level)        (exact)
+        for BLOCK_N tile in [k_lo, k_hi):                        (level-local)
+          K, V = rings[ring_offsets[level] + tile % caps[level]]  (storage)
+          QK matmul [+ relative bias], softcap, online-softmax update
+
+    Same contract as multilevel_attention_forward for one row: out
+    [B, 1, Hq, Dv] in V's dtype, lse [B, 1, Hq] float32 natural-log LSE of
+    the softcapped scores over exactly A(t). Positional modes are identical
+    to the forward's: "rope" rotates Q at t and each K entry at
+    summary_token_position(level, j) = (j+1)*2^level - 1 (rotate-half,
+    tables must cover [0, t]); "relative" adds the learned summary-bin bias
+    before softcap with distances from the shared _tile_bin_distances
+    (relative_states is [B, 1, Hq, d_rel] from compute_relative_states over
+    the token's ORIGINAL hidden state).
+
+    Also returns `stats`, a diagnostic dict (never asserted on in
+    production): entries [(level, j)] in gather order plus the aligned
+    `positions` (rope) / `distances` (relative) lists.
+    """
+    if q_t.dim() != 4 or q_t.shape[1] != 1:
+        raise ValueError(f"q_t must be [B, 1, Hq, Dk], got {tuple(q_t.shape)}")
+    if state.t < 1:
+        raise ValueError("no token has been consumed yet")
+    B, _, Hq, Dk = q_t.shape
+    Bs, _, Hkv, Dks = state.k.shape
+    Dv = state.v.shape[-1]
+    if Bs != B or Dks != Dk:
+        raise ValueError(
+            f"q_t {tuple(q_t.shape)} incompatible with the state's keys "
+            f"{tuple(state.k.shape)}"
+        )
+    if Hq % Hkv != 0:
+        raise ValueError(f"Hq={Hq} must be divisible by Hkv={Hkv}.")
+    expansion = Hq // Hkv
+    t = state.t - 1
+    device = q_t.device
+    spec = state.spec(t + 1)
+
+    rel_logits, max_relative_bins = _positional_setup(
+        position_mode, rope_cos, rope_sin, relative_states, relative_proj,
+        B=B, N=1, Hq=Hq, Dk=Dk, spec=spec, rope_positions=t + 1,
+    )
+
+    # Per-level visible bounds of the single row, [1, num_levels].
+    bounds = [range_bounds(spec, t, lv) for lv in range(spec.num_levels)]
+    row_lo = torch.tensor([[lo for lo, _ in bounds]], device=device,
+                          dtype=torch.long)
+    row_hi = torch.tensor([[hi for _, hi in bounds]], device=device,
+                          dtype=torch.long)
+
+    Q = q_t[:, 0]  # [B, Hq, Dk]
+    if position_mode == "rope":
+        Q = apply_rope(
+            Q, torch.tensor(t, device=device, dtype=torch.long),
+            rope_cos, rope_sin,
+        )
+    Q = Q.view(B, Hkv, expansion, Dk)  # GQA grouping: hq = hkv*E + e
+    scale = 1.0 / math.sqrt(Dk)
+
+    m = torch.full((B, Hkv, expansion), -float("inf"), device=device,
+                   dtype=torch.float32)
+    ell = torch.zeros(B, Hkv, expansion, device=device, dtype=torch.float32)
+    acc = torch.zeros(B, Hkv, expansion, Dv, device=device,
+                      dtype=torch.float32)
+    stats = {"entries": [], "positions": [], "distances": []}
+
+    for level in range(spec.num_levels):
+        k_lo, k_hi = bounds[level]
+        if k_lo == k_hi:
+            continue
+        for k_start in range(k_lo, k_hi, block_n):
+            k_end = min(k_start + block_n, k_hi)
+            kv_indices = torch.arange(
+                k_start, k_end, device=device, dtype=torch.long
+            )
+            slots = _ring_slots(state, level, kv_indices)
+            K = state.k[:, slots]  # [B, Kt, Hkv, Dk]
+            V = state.v[:, slots]  # [B, Kt, Hkv, Dv]
+            stats["entries"].extend((level, j) for j in range(k_start, k_end))
+
+            if position_mode == "rope":
+                # summary_token_position, vectorized; V untouched.
+                k_pos = (kv_indices + 1) * (1 << level) - 1
+                K = apply_rope(K, k_pos.view(1, -1, 1), rope_cos, rope_sin)
+                stats["positions"].extend(k_pos.tolist())
+
+            scores = torch.einsum("bhed,bkhd->bhek", Q, K) * scale
+
+            if position_mode == "relative":
+                # Every lane is valid: the row's range is exact.
+                valid = torch.ones(
+                    1, k_end - k_start, device=device, dtype=torch.bool
+                )
+                dist = _tile_bin_distances(
+                    spec, row_lo, row_hi, kv_indices, level,
+                    max_relative_bins, valid, t, t + 1,
+                )  # [1, Kt]
+                stats["distances"].extend(dist[0].tolist())
+                rel_t = rel_logits[:, 0].view(
+                    B, Hkv, expansion, max_relative_bins
+                )
+                bias = torch.gather(
+                    rel_t, 3,
+                    dist.view(1, 1, 1, -1).expand(B, Hkv, expansion, -1),
+                )
+                # X = QK/sqrt(Dk) + b, BEFORE softcap; fp32 promotion.
+                scores = scores + bias
+
+            if softcap is not None:
+                scores = softcap * torch.tanh(scores / softcap)
+
+            # FlashAttention online-softmax update; no masking needed.
+            block_max = scores.float().max(dim=-1).values
+            m_new = torch.maximum(m, block_max)
+            old_scale = torch.exp(m - m_new)  # exp(-inf) = 0 on the first tile
+            p = torch.exp(scores.float() - m_new[..., None])
+            ell = ell * old_scale + p.sum(dim=-1)
+            acc = (
+                acc * old_scale[..., None]
+                + torch.einsum("bhek,bkhd->bhed", p, V.float())
+            )
+            m = m_new
+
+    if (ell == 0).any():
+        raise RuntimeError(
+            f"decode query t={t} has no attended KV entries."
+        )
+    out = (acc / ell[..., None]).reshape(B, 1, Hq, Dv).to(state.v.dtype)
+    lse = (m + torch.log(ell)).reshape(B, 1, Hq)
+    return out, lse, stats
+
+
+def decode_step(
+    x_t: torch.Tensor,
+    q_t: torch.Tensor,
+    k_t: torch.Tensor,
+    v_t: torch.Tensor,
+    state: DecodeState,
+    *,
+    weight_mode: str = "qk",
+    w_proj: Optional[torch.Tensor] = None,
+    k_conv_weight: Optional[torch.Tensor] = None,
+    v_conv_weight: Optional[torch.Tensor] = None,
+    block_n: int = 32,
+    softcap: float = 20.0,
+    position_mode: str = "none",
+    rope_cos: Optional[torch.Tensor] = None,
+    rope_sin: Optional[torch.Tensor] = None,
+    relative_weight: Optional[torch.Tensor] = None,
+    relative_proj: Optional[torch.Tensor] = None,
+    sinks: Optional[torch.Tensor] = None,
+    gate_weight: Optional[torch.Tensor] = None,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    The complete telescope block for ONE token, after the Q/K/V projections
+    (the one-token analogue of minimal_attention_block, minus the output
+    projection):
+
+        (x_t, q_t, k_t, v_t)  [B, 1, ...]
+          -> advance_decode_state    (short conv + merge weight + tree update)
+          -> multilevel_attention_decode   (positional mode)  -> (out, lse)
+          -> apply_attention_sink(out, lse, sinks)             (optional)
+          -> apply_output_gate(out, x_t, gate_weight)          (optional)
+
+    x_t is the token's ORIGINAL hidden state [B, 1, emb] (linear weights,
+    relative states, gate). Returns (out [B, 1, Hq, Dv] post-sink/gate,
+    lse [B, 1, Hq] pre-sink float32) -- the frozen attention-boundary
+    terminology. The state is advanced in place.
+    """
+    if weight_mode == "qk":
+        if w_proj is not None:
+            raise ValueError("w_proj provided with weight_mode='qk'")
+        weight_kwargs = {}
+    elif weight_mode == "linear":
+        if w_proj is None:
+            raise ValueError("weight_mode='linear' requires w_proj")
+        weight_kwargs = dict(x_t=x_t, w_proj=w_proj)
+    else:
+        raise ValueError(f"unknown weight_mode {weight_mode!r}")
+    advance_decode_state(
+        state, q_t, k_t, v_t,
+        k_conv_weight=k_conv_weight, v_conv_weight=v_conv_weight,
+        **weight_kwargs,
+    )
+    relative_states = None
+    if position_mode == "relative":
+        if relative_weight is None or relative_proj is None:
+            raise ValueError(
+                "position_mode='relative' requires relative_weight and "
+                "relative_proj"
+            )
+        relative_states = compute_relative_states(
+            x_t, relative_weight, q_t.shape[2]
+        )
+    elif relative_weight is not None:
+        raise ValueError(
+            f"relative_weight provided with position_mode={position_mode!r}"
+        )
+    out, lse, _ = multilevel_attention_decode(
+        q_t, state, block_n=block_n, softcap=softcap,
+        position_mode=position_mode, rope_cos=rope_cos, rope_sin=rope_sin,
+        relative_states=relative_states, relative_proj=relative_proj,
+    )
+    if sinks is not None:
+        out = apply_attention_sink(out, lse, sinks)
+    if gate_weight is not None:
+        out = apply_output_gate(out, x_t, gate_weight)
+    return out, lse
